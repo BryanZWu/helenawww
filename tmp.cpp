@@ -2,6 +2,8 @@
 // Created by Chancellor Pascale on 1/31/21.
 //
 #include "assignment.h"
+std::mutex mtx;
+
 
 void executeTicketingSystemParticipation() {
 	// For debugging purposes you might want to output the thread's ticketNumber
@@ -15,6 +17,8 @@ void executeTicketingSystemParticipation() {
 	outputFile << "C++11: Thread retrieved ticket number: " << ticketNumber << " started.\n";
 	
 	// wait until your ticket number has been called output your ticket number and the current time
+	std::unique_lock<std::mutex> lock(mtx);
+	cv.wait(lock, [myTicket]() { return myTicket == currentTicketNumber; });
 
 	// NOTE: Do not remove this output to file statement as it is used to grade assignment,
 	// so it should be called by each thread
