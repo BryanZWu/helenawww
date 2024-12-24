@@ -5,6 +5,10 @@
 std::mutex mtx;
 
 
+std::atomic<int> global_counter = 0;
+std::mutex global_mutex;
+std::condition_variable cv;
+
 void executeTicketingSystemParticipation() {
 	// For debugging purposes you might want to output the thread's ticketNumber
 	std::cout << "Current thread ticket number: " << ticketNumber << "\n";
@@ -27,6 +31,7 @@ void executeTicketingSystemParticipation() {
 	
 	// Increment currentTicketNumber variable to allow other threads to do their job
 	currentTicketNumber++;
+	cv.notify_all();
 }
 
 int runSimulation() {
@@ -37,13 +42,13 @@ int runSimulation() {
 		std::atomic<int> currentTicketNumber;
 		ticketMachineNumber = -1;
 		currentTicketNumber = -1;
-		
+
 		std::thread threads[currentNumThreads];
-		
+
 		for(int threadIndex = 0; threadIndex < currentNumThreads; ++threadIndex){
 			// This is where you will start threads that will participate in a ticketing system
 			// have the thread run the executeTicketingSystemParticipation function
-			// std::thread(executeTicketingSystemParticipation, threadIndex);
+			std::thread(executeTicketingSystemParticipation, threadIndex);
 
 			}
 		
@@ -79,8 +84,16 @@ int manageTicketingSystem() {
 	outputFile << "C++11: Signaling threads to do work.\n";
 	
 	// Increment a ticket number shared by a number of threads and check that no active threads are running
+	for (int ticket_number = 0; ticket_number < numThreads; ticket_number++) {
+		global_counter = ticket_number;
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+	}
 	
 	// Wait for all threads to complete
+		
+	foreach (std::thread: threads[currentNumThreads]){
+		thread.join()
+	}
 	
 	outputFile << "C++11: All threads completed.\n";
 	outputFile.close();
