@@ -17,18 +17,27 @@ def execute_ticketing_system_participation(ticket_number, part_id, shared_variab
     print("Thread retrieved ticket number: {} started".format(ticket_number), file=open(output_file_name, "a"))
     time.sleep(random.randint(0, 10))
     # wait until your ticket number has been called
-    lock = shared_variable[0]
+    cv = shared_variable[0]
     # output your ticket number and the current time
-    while True:
-        lock.wait() # Condition.wait
-        lock.acquire() # does not wait for the shared variable to change
-        if shared_variable[1] == ticket_number:
-            # do stuff here
-            shared_variable[1] += 1
-            lock.notify_all()
-            break
-        lock.release()
-    lock.release()
+
+    cv.acquire()
+    while shared_variable[1] != ticket_number:
+        cv.wait()
+    shared_variable[1] += 1
+    cv.release()
+    # cv.wait_for(shared_variable[1] == ticket_number)
+    
+
+    # while True:
+    #     lock.wait() # Condition.wait
+    #     lock.acquire() # does not wait for the shared variable to change
+    #     if shared_variable[1] == ticket_number:
+    #         # do stuff here
+    #         shared_variable[1] += 1
+    #         lock.notify_all()
+    #         break
+    #     lock.release()
+    # lock.release()
 
     # while True:
     #     if shared_variable[1] == ticket_number:
