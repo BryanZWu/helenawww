@@ -34,8 +34,8 @@ CUmodule   module;
 CUfunction function;
 size_t     totalGlobalMem;
 
-// char       *module_file = (char*) "matSumKernel.fatbin";
-char       *module_file = (char*) "matSumKernel.ptx";
+char       *module_file = (char*) "matSumKernel.fatbin";
+// char       *module_file = (char*) "matSumKernel.ptx";
 char       *kernel_name = (char*) "matSum";
 
 

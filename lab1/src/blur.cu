@@ -59,19 +59,36 @@ float cuda_call_blur_kernel(const unsigned int blocks,
     //       has n_frames elements. Then copy the data in raw_data into the
     //       GPU memory you allocated.
     float* gpu_raw_data;
+    if (cudaMalloc(&gpu_raw_data, n_frames * sizeof(float))) {
+        // TODO handle exception here
+    }
+    cudaMemcpy(gpu_raw_data, raw_data, n_frames, cudaMemcpyHostToDevice);
 
     // TODO: Allocate GPU memory for the impulse signal (for now global GPU
     //       memory is fine. The data is of type float and has blur_v_size
     //       elements. Then copy the data in blur_v into the GPU memory you
     //       allocated.
     float* gpu_blur_v;
+    if (cudaMalloc(&gpu_blur_v, blur_v_size * sizeof(float))) {
+    }
+    cudaMemcpy(gpu_blur_v, blur_v, n_frames, cudaMemcpyHostToDevice);
 
     // TODO: Allocate GPU memory to store the output audio signal after the
     //       convolution. The data is of type float and has n_frames elements.
     //       Initialize the data as necessary.
     float* gpu_out_data;
+    if (cudaMalloc(&gpu_out_data, n_frames * sizeof(float))) {
+    }
+    cudaMemset(gpu_out_data, 0, n_frames);
     
     // TODO: Appropriately call the kernel function.
+    cuda_blur_kernel(
+        gpu_raw_data,
+        gpu_blur_v,
+        gpu_out_data,
+        n_frames,
+        blur_v_size,
+    );
 
     // Check for errors on kernel call
     cudaError err = cudaGetLastError();
@@ -83,9 +100,13 @@ float cuda_call_blur_kernel(const unsigned int blocks,
     // TODO: Now that kernel calls have finished, copy the output signal
     //       back from the GPU to host memory. (We store this channel's result
     //       in out_data on the host.)
+    cudaMemcpy(out_data, gpu_out_data, n_frames, cudaMemcpyDeviceToHost);
 
     // TODO: Now that we have finished our computations on the GPU, free the
     //       GPU resources.
+    cudaFree(gpu_blur_v);
+    cudaFree(gpu_out_data);
+    cudaFree(gpu_raw_data);
 
     // Stop the recording timer and return the computation time
     cudaEventRecord(stop_gpu);
