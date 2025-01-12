@@ -42,6 +42,7 @@ cudaProdScaleKernel(const cufftComplex *raw_data, const cufftComplex *impulse_v,
 
     /* TODO: Implement the point-wise multiplication and scaling for the
     FFT'd input and impulse response. 
+    (a + bi)(c + di) = (ac - bd) + (ad + bc)i
 
     Recall that these are complex numbers, so you'll need to use the
     appropriate rule for multiplying them. 
@@ -53,6 +54,23 @@ cudaProdScaleKernel(const cufftComplex *raw_data, const cufftComplex *impulse_v,
     resilient to varying numbers of threads.
 
     */
+    uint thread_index;
+    thread_index = threadIdx.x + blockDim.x * blockIdx.x;
+    // TODO: potentially need to cast padded_length to a float here
+
+    // First, elementwise multiplication
+    while (thread_index < padded_length) {
+        cufftComplex raw_data_i = raw_data[thread_index]
+        cufftComplex impulse_i = impulse_v[thread_index]
+        
+        out_data[thread_index].x = (raw_data_i.x * impulse_i.x - raw_data_i.y * impulse_i.y) / padded_length
+        out_data[thread_index].y = (raw_data_i.x * impulse_i.y + raw_data_i.y * impulse_i.x) / padded_length
+        thread_index += blockDim.x * gridDim.x; // advance one grid (num of threads of grid) each time
+    }
+
+    // Normalizing afterwards （＾_＾）
+    // 
+
 }
 
 __global__
@@ -127,5 +145,5 @@ void cudaCallDivideKernel(const unsigned int blocks,
         float *max_abs_val,
         const unsigned int padded_length) {
         
-    /* TODO 2: Call the division kernel. */
+    /* TODO 2:  Call the division kernel. */
 }
