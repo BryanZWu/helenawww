@@ -244,9 +244,9 @@ int large_gauss_test(int argc, char **argv){
 
     Also, unlike in Homework 1, we don't copy our impulse response
     yet, because this is now given to us per-channel. */
-    gpuErrChk(cudaMalloc(&dev_input_data, padded_length * sizeof(cufftComplex)));
-    gpuErrChk(cudaMalloc(&dev_impulse_v, padded_length * sizeof(cufftComplex)));
-    gpuErrChk(cudaMalloc(&dev_out_data, padded_length * sizeof(cufftComplex)));
+    gpuErrchk(cudaMalloc(&dev_input_data, padded_length * sizeof(cufftComplex)));
+    gpuErrchk(cudaMalloc(&dev_impulse_v, padded_length * sizeof(cufftComplex)));
+    gpuErrchk(cudaMalloc(&dev_out_data, padded_length * sizeof(cufftComplex)));
 
 
 
@@ -389,9 +389,9 @@ int large_gauss_test(int argc, char **argv){
         x[n] as read from the input audio file, and not the padding, 
         so be careful with the size of your memory copy. */
 
-        gpuErrChk(cudaMemset(d_input, 0, padded_length * sizeof(cufftComplex), 
+        gpuErrchk(cudaMemset(d_input, 0, padded_length * sizeof(cufftComplex), 
             cudaMemcpyHostToDevice));
-        gpuErrChk(cudaMemcpy(input, d_input, N * sizeof(cufftComplex), 
+        gpuErrchk(cudaMemcpy(input, d_input, N * sizeof(cufftComplex), 
             cudaMemcpyHostToDevice));
 
         /* TODO: Copy this channel's impulse response data (stored in impulse_data)
