@@ -128,10 +128,10 @@ void optimalTransposeKernel(const float *input, float *output, int n) {
     // // No bank conflict: stride by 33 instead
     // Block reads from data
     // With this, we have 0.011264 for size 512, and 0.574464 for size 4096.
-    for (; j < end_j; j++) {
-        data[((j % 64) + 65 * (i % 64))] = input[i + n * j];
-        // data[(j + 64 * i) + i] = input[i + n * j];
-    }
+    // for (; j < end_j; j++) {
+    //     data[((j % 64) + 65 * (i % 64))] = input[i + n * j];
+    //     // data[(j + 64 * i) + i] = input[i + n * j];
+    // }
 
     // And now unroll loop
     // data[((j % 64) + 65 * (i % 64))] = input[i + n * j];
@@ -140,19 +140,19 @@ void optimalTransposeKernel(const float *input, float *output, int n) {
     // data[(((j+3) % 64) + 65 * (i % 64))] = input[i + n * (j+3)];
 
     // // And ILP: Haven't finished this yet.
-    // int data_start_ind = (j % 64) + 65 * (i % 64);
-    // int data_start_ind_2 = data_start_ind + 1;
-    // int data_start_ind_3 = data_start_ind + 2;
-    // int data_start_ind_4 = data_start_ind + 3;
+    int data_start_ind = (j % 64) + 65 * (i % 64);
+    int data_start_ind_2 = data_start_ind + 1;
+    int data_start_ind_3 = data_start_ind + 2;
+    int data_start_ind_4 = data_start_ind + 3;
 
-    // int input_start_ind = i + n * j;
-    // int input_start_ind_2 = input_start_ind + n;
-    // int input_start_ind_3 = input_start_ind + 2 * n;
-    // int input_start_ind_4 = input_start_ind + 3 * n;
-    // data[data_start_ind] = input[input_start_ind];
-    // data[data_start_ind_2] = input[input_start_ind_2];
-    // data[data_start_ind_3] = input[input_start_ind_3];
-    // data[data_start_ind_4] = input[input_start_ind_4];
+    int input_start_ind = i + n * j;
+    int input_start_ind_2 = input_start_ind + n;
+    int input_start_ind_3 = input_start_ind + 2 * n;
+    int input_start_ind_4 = input_start_ind + 3 * n;
+    data[data_start_ind] = input[input_start_ind];
+    data[data_start_ind_2] = input[input_start_ind_2];
+    data[data_start_ind_3] = input[input_start_ind_3];
+    data[data_start_ind_4] = input[input_start_ind_4];
     __syncthreads();
     // i_out needs to iterate over whatever j was.
     // i_out needs to iterate over whatever i was.
