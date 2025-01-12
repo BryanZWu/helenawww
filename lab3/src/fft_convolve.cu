@@ -60,11 +60,13 @@ cudaProdScaleKernel(const cufftComplex *raw_data, const cufftComplex *impulse_v,
 
     // First, elementwise multiplication
     while (thread_index < padded_length) {
-        cufftComplex raw_data_i = raw_data[thread_index]
-        cufftComplex impulse_i = impulse_v[thread_index]
+        cufftComplex raw_data_i = raw_data[thread_index];
+        cufftComplex impulse_i = impulse_v[thread_index];
         
-        out_data[thread_index].x = (raw_data_i.x * impulse_i.x - raw_data_i.y * impulse_i.y) / padded_length
-        out_data[thread_index].y = (raw_data_i.x * impulse_i.y + raw_data_i.y * impulse_i.x) / padded_length
+        out_data[thread_index].x = (raw_data_i.x * impulse_i.x - raw_data_i.y * impulse_i.y) / padded_length;
+        out_data[thread_index].y = (raw_data_i.x * impulse_i.y + raw_data_i.y * impulse_i.x) / padded_length;
+        // out_data[thread_index].x = raw_data_i.x;
+        // out_data[thread_index].y = raw_data_i.y;
         thread_index += blockDim.x * gridDim.x; // advance one grid (num of threads of grid) each time
     }
 
@@ -125,6 +127,9 @@ void cudaCallProdScaleKernel(const unsigned int blocks,
         const unsigned int padded_length) {
         
     /* TODO: Call the element-wise product and scaling kernel. */
+    cudaProdScaleKernel<<<blocks, threadsPerBlock>>>(
+        raw_data, impulse_v, out_data, padded_length
+    );
 }
 
 void cudaCallMaximumKernel(const unsigned int blocks,
@@ -135,6 +140,9 @@ void cudaCallMaximumKernel(const unsigned int blocks,
         
 
     /* TODO 2: Call the max-finding kernel. */
+    cudaMaximumKernel<<<blocks, threadsPerBlock>>>(
+        out_data, max_abs_val, padded_length
+    );
 
 }
 
@@ -146,4 +154,7 @@ void cudaCallDivideKernel(const unsigned int blocks,
         const unsigned int padded_length) {
         
     /* TODO 2:  Call the division kernel. */
+    cudaDivideKernel<<<blocks, threadsPerBlock>>>(
+        out_data, max_abs_val, padded_length
+    );
 }

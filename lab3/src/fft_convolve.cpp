@@ -389,6 +389,7 @@ int large_gauss_test(int argc, char **argv){
         Note that input_data only stores
         x[n] as read from the input audio file, and not the padding, 
         so be careful with the size of your memory copy. */
+        std::cout << "copying input from host to gpu" << std::endl;
 
         gpuErrchk(cudaMemset(dev_input_data, 0, padded_length * sizeof(cufftComplex)));
         gpuErrchk(cudaMemcpy(dev_input_data, input_data, N * sizeof(cufftComplex), 
@@ -411,6 +412,7 @@ int large_gauss_test(int argc, char **argv){
         gpuErrchk(cudaMemcpy(dev_impulse_v, impulse_data, impulse_length * sizeof(cufftComplex), 
             cudaMemcpyHostToDevice));
 
+        std::cout << "Helena test 2" << std::endl;
 
 
 
@@ -420,10 +422,15 @@ int large_gauss_test(int argc, char **argv){
         cufftHandle plan;
         /* Create a 1D FFT plan. */ 
         int batch = 1; // Number of transforms to run 
+        std::cout << "Helena test 3" << std::endl;
         cufftPlan1d (&plan, padded_length, CUFFT_C2C, batch); /* Transform the first signal in place, nx is size of fft */ 
+        std::cout << "Helena test 4" << std::endl;
 
         cufftExecC2C (plan, dev_input_data, dev_input_data, CUFFT_FORWARD);
+        cufftExecC2C (plan, dev_impulse_v, dev_impulse_v, CUFFT_FORWARD);
+
         // cudaMemcpy (data_back, dev_input_data, NX*sizeof (cufftComplex), cudaMemcpyDeviceIoHost); // we dont need this
+        std::cout << "Helena test 5" << std::endl;
 
 
 
@@ -434,7 +441,13 @@ int large_gauss_test(int argc, char **argv){
         cudaCallProdScaleKernel(blocks, local_size, 
             dev_input_data, dev_impulse_v, dev_out_data,
             padded_length);
+        // for (int i = 0; i < 10; i++){
+        //     cerr << "BRYAN DEBUG: index " << i << ": " << output_data_host[i] << ", " 
+        //         << output_data_testarr[i].x << endl;
+        // }
 
+        // gpuErrchk(cudaMemcpy(dev_out_data, dev_input_data, padded_length * sizeof(cufftComplex), cudaMemcpyDeviceToDevice));
+        // gpuErrchk(cudaMemset(dev_out_data, dev_input_data, padded_length * sizeof(cufftComplex)));
 
         // Check for errors on kernel call
         cudaError err = cudaGetLastError();
@@ -601,7 +614,8 @@ int large_gauss_test(int argc, char **argv){
 
         Note that we have a padded-length signal, so be careful of the
         size of the memory copy. */
-
+        cudaMemcpy(output_data, dev_out_data, padded_length * sizeof(cufftComplex), 
+            cudaMemcpyDeviceToHost);
 
         cout << endl;
         cout << "CPU normalization constant: " << max_abs_val << endl;
