@@ -101,8 +101,23 @@ cudaMaximumKernel(cufftComplex *out_data, float *max_abs_val,
         compare-float-in-cuda)
 
     */
+    // extern declare share memory
+    // find max of stride 32  for each thread (# of banks)
+    // write result back to index increment by length of array / num of blocks / 32
+    // syncthreads()
+    // repeat until something is 1 (potentially nice to pad length of array to be power of 2)
+    // if threadindex == 0: atomic max (collect max of each block)
 
 
+    // 1. Declaring shared memory: basically assume for this problem that
+    // you can fit the entire array (divided by num_blocks).
+    // 2. Copy global stuff to large shared memory
+    // 3. Iteration for reduction, log(num_items_per_block) times: 
+    //    - If thread index is > num_threads_per_block / (2 ** i), no-op
+    //    - otherwise, move memory from 2*thread_idx and accumulate there
+    //    - synchronize
+    // 4. Copy stuff back
+    
 }
 
 __global__
