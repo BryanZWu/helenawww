@@ -231,6 +231,7 @@ int large_gauss_test(int argc, char **argv){
 
 
     // Output storage for CPU implementation
+    float *output_data_host = (float*)malloc(padded_length * sizeof(float));
 
     // GPU copies of arrays
     cufftComplex *dev_input_data;
@@ -389,9 +390,8 @@ int large_gauss_test(int argc, char **argv){
         x[n] as read from the input audio file, and not the padding, 
         so be careful with the size of your memory copy. */
 
-        gpuErrchk(cudaMemset(d_input, 0, padded_length * sizeof(cufftComplex), 
-            cudaMemcpyHostToDevice));
-        gpuErrchk(cudaMemcpy(input, d_input, N * sizeof(cufftComplex), 
+        gpuErrchk(cudaMemset(dev_input_data, 0, padded_length * sizeof(cufftComplex)));
+        gpuErrchk(cudaMemcpy(dev_input_data, input_data, N * sizeof(cufftComplex), 
             cudaMemcpyHostToDevice));
 
         /* TODO: Copy this channel's impulse response data (stored in impulse_data)
@@ -407,9 +407,8 @@ int large_gauss_test(int argc, char **argv){
         (See Lecture 9 for details on padding.)
         Set the rest of the memory regions to 0 (recommend using cudaMemset).
         */
-        gpuErrChk(cudaMemset(dev_impulse_v, 0, padded_length * sizeof(cufftComplex), 
-            cudaMemcpyHostToDevice));
-        gpuErrChk(cudaMemcpy(impulse_data, dev_impulse_v, impulse_length * sizeof(cufftComplex), 
+        gpuErrchk(cudaMemset(dev_impulse_v, 0, padded_length * sizeof(cufftComplex)));
+        gpuErrchk(cudaMemcpy(dev_impulse_v, impulse_data, impulse_length * sizeof(cufftComplex), 
             cudaMemcpyHostToDevice));
 
 
@@ -420,8 +419,8 @@ int large_gauss_test(int argc, char **argv){
         */
         cufftHandle plan;
         /* Create a 1D FFT plan. */ 
-        int batch = 1: // Number of transforms to run 
-        cufftPlanld (&plan, padded_length, CUFFT_C2C, batch); /* Transform the first signal in place, nx is size of fft */ 
+        int batch = 1; // Number of transforms to run 
+        cufftPlan1d (&plan, padded_length, CUFFT_C2C, batch); /* Transform the first signal in place, nx is size of fft */ 
 
         cufftExecC2C (plan, dev_input_data, dev_input_data, CUFFT_FORWARD);
         // cudaMemcpy (data_back, dev_input_data, NX*sizeof (cufftComplex), cudaMemcpyDeviceIoHost); // we dont need this
