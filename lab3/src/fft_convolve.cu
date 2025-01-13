@@ -155,7 +155,7 @@ cudaMaximumKernel(cufftComplex *out_data, float *max_abs_val,
             shm[threadIdx.x + blockDim.x].x = 0.0;
             // float test = shm[threadIdx.x + blockDim.x].x;
         } else {
-            shm[threadIdx.x + blockDim.x]; // = out_data[thread_index + blockDim.x];
+            shm[threadIdx.x + blockDim.x] = out_data[thread_index + blockDim.x];
         }
 
         
@@ -165,7 +165,7 @@ cudaMaximumKernel(cufftComplex *out_data, float *max_abs_val,
             float right_magnitude = fabsf(shm[threadIdx.x + num_items_to_process_per_block].x);
             float bigger = max(left_magnitude, right_magnitude);
             //  bigger = shm[thread_index], shm[thread_index + 32]; // stride 32 to avoid bank conflict
-            // shm[threadIdx.x].x = bigger;
+            shm[threadIdx.x].x = bigger;
             num_items_to_process_per_block = num_items_to_process_per_block / 2;
             __syncthreads();
         }
@@ -215,7 +215,7 @@ void cudaCallMaximumKernel(const unsigned int blocks,
         
 
     /* TODO 2: Call the max-finding kernel. */
-    cudaMaximumKernel<<<blocks, threadsPerBlock, threadsPerBlock * 2>>>(
+    cudaMaximumKernel<<<blocks, threadsPerBlock, threadsPerBlock * 2 * sizeof(float)>>>(
         out_data, max_abs_val, padded_length
     );
 
