@@ -127,27 +127,45 @@ cudaMaximumKernel(cufftComplex *out_data, float *max_abs_val,
     // const uint length = padded_length;
     // const uint nearest_pow_2 = 1u << (32 - __clz(num_items_to_process_per_block * 2 - 1));
     // __shared__ cufftComplex shm [nearest_pow_2];
-    extern __shared__ cufftComplex shm []; // we need block dim times 2
+    extern __shared__ cufftComplex shm []; // we need size of block dim times 2
     uint thread_index;
-    thread_index = threadIdx.x + 2 * blockDim.x * blockIdx.x; // Thread offset within the block?
+    thread_index = threadIdx.x + 2 * blockDim.x * blockIdx.x; // Thread_index is global while threadidx is withinin local
     uint num_items_to_process_per_block;
-    // Loop over grids
-    while (thread_index < padded_length - blockDim.x) {
-        // if (thread_index  + num_items_to_process_per_block >= num_items_to_process_per_block * 2) {
-        //     shm[thread_index + num_items_to_process_per_block].x = 0;
-        // } else {
-        //     shm[thread_index + num_items_to_process_per_block] = out_data[thread_index + num_items_to_process_per_block];
-        // }
-        shm[threadIdx.x] = out_data[thread_index];
-    
+    // Loop over grids. Each block processes 2*num_threads_per_block entries. 
+    // Edge cases for the last grid:
+    // - case 1: padded_length - start_of_block < num_threads_per_block
+    // - case 2: padded_length - start_of_block < num_threads_per_block * 2
+    // Both cases are resolved adequately by setting the OOB components to 
+    // 0 in shm. Case 1 can be resolved with the (thread_index < padded_length)
+    // in the while loop (to avoid ops on OOB stuff), and case 2 will be resolved 
+    // by setting the value of thread_index _ num_items_to_process_per_block to 0.
+
+    // While the first thread of this block < padded length
+    // AKA while this is a valid block, note that some threads in the last block could be > padded length
+    while (thread_index - threadIdx.x < padded_length) {
         num_items_to_process_per_block = blockDim.x;
+        // Pad both parts of the data that this thread is responsible for:
+        // thread_index, and threaed_index + num_items_toprocess_per_block
+        if (thread_index >= padded_length) {
+            shm[threadIdx.x].x = 0.0;
+        } else {
+            shm[threadIdx.x] = out_data[thread_index];
+        }
+        if (thread_index + blockDim.x >= padded_length) {
+            shm[threadIdx.x + blockDim.x].x = 0.0;
+            // float test = shm[threadIdx.x + blockDim.x].x;
+        } else {
+            shm[threadIdx.x + blockDim.x]; // = out_data[thread_index + blockDim.x];
+        }
+
+        
         // // Loop over the items within the block?
         while (num_items_to_process_per_block >= 1) {
             float left_magnitude = fabsf(shm[threadIdx.x].x);
             float right_magnitude = fabsf(shm[threadIdx.x + num_items_to_process_per_block].x);
             float bigger = max(left_magnitude, right_magnitude);
             //  bigger = shm[thread_index], shm[thread_index + 32]; // stride 32 to avoid bank conflict
-            shm[threadIdx.x].x = bigger;
+            // shm[threadIdx.x].x = bigger;
             num_items_to_process_per_block = num_items_to_process_per_block / 2;
             __syncthreads();
         }
