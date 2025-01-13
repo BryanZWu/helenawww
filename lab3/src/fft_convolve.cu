@@ -126,7 +126,8 @@ cudaMaximumKernel(cufftComplex *out_data, float *max_abs_val,
     // copy from out data global memory to shared_input
     // const uint length = padded_length;
     uint num_items_to_process_per_block = blockDim.x;
-    const uint nearest_pow_2 = static_cast<int>(std::pow(2, std::ceil(std::log2(num_items_to_process_per_block * 2))));
+    // const uint nearest_pow_2 = 1u << (32 - __clz(num_items_to_process_per_block * 2 - 1));
+;
     // __shared__ cufftComplex shm [nearest_pow_2];
     extern __shared__ cufftComplex shm [];
     uint thread_index;
