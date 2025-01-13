@@ -125,30 +125,29 @@ cudaMaximumKernel(cufftComplex *out_data, float *max_abs_val,
 
     // copy from out data global memory to shared_input
     // const uint length = padded_length;
-    uint num_items_to_process_per_block = blockDim.x;
     // const uint nearest_pow_2 = 1u << (32 - __clz(num_items_to_process_per_block * 2 - 1));
-;
     // __shared__ cufftComplex shm [nearest_pow_2];
-    extern __shared__ cufftComplex shm [];
+    extern __shared__ cufftComplex shm []; // we need block dim times 2
     uint thread_index;
-    thread_index = threadIdx.x + blockDim.x * blockIdx.x; // Thread offset within the block?
-
+    thread_index = threadIdx.x + 2 * blockDim.x * blockIdx.x; // Thread offset within the block?
+    uint num_items_to_process_per_block;
     // Loop over grids
-    while (thread_index < padded_length) {
-        if (thread_index  + num_items_to_process_per_block >= num_items_to_process_per_block * 2) {
-            shm[thread_index + num_items_to_process_per_block].x = 0;
-        } else {
-            shm[thread_index + num_items_to_process_per_block] = out_data[thread_index + num_items_to_process_per_block];
-        }
-        shm[thread_index] = out_data[thread_index];
+    while (thread_index < padded_length - blockDim.x) {
+        // if (thread_index  + num_items_to_process_per_block >= num_items_to_process_per_block * 2) {
+        //     shm[thread_index + num_items_to_process_per_block].x = 0;
+        // } else {
+        //     shm[thread_index + num_items_to_process_per_block] = out_data[thread_index + num_items_to_process_per_block];
+        // }
+        shm[threadIdx.x] = out_data[thread_index];
     
-        // Loop over the items within the block?
-        while (num_items_to_process_per_block > 1) {
-            float left_magnitude = abs(shm[thread_index].x);
-            float right_magnitude = abs(shm[thread_index + num_items_to_process_per_block].x);
+        num_items_to_process_per_block = blockDim.x;
+        // // Loop over the items within the block?
+        while (num_items_to_process_per_block >= 1) {
+            float left_magnitude = fabsf(shm[threadIdx.x].x);
+            float right_magnitude = fabsf(shm[threadIdx.x + num_items_to_process_per_block].x);
             float bigger = max(left_magnitude, right_magnitude);
             //  bigger = shm[thread_index], shm[thread_index + 32]; // stride 32 to avoid bank conflict
-            shm[thread_index].x = bigger;
+            shm[threadIdx.x].x = bigger;
             num_items_to_process_per_block = num_items_to_process_per_block / 2;
             __syncthreads();
         }
@@ -198,7 +197,7 @@ void cudaCallMaximumKernel(const unsigned int blocks,
         
 
     /* TODO 2: Call the max-finding kernel. */
-    cudaMaximumKernel<<<blocks, threadsPerBlock>>>(
+    cudaMaximumKernel<<<blocks, threadsPerBlock, threadsPerBlock * 2>>>(
         out_data, max_abs_val, padded_length
     );
 

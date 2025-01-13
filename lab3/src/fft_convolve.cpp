@@ -176,7 +176,7 @@ int large_gauss_test(int argc, char **argv){
     parameter to control how many trials we run. */
 
     int nChannels = 2;      // Can set as the number of trials
-    int N = 1e6;        // Can set how many data points arbitrarily
+    int N = 1e5;        // Can set how many data points arbitrarily
     int impulse_length = GAUSSIAN_SIZE;
 
 #endif
@@ -412,7 +412,6 @@ int large_gauss_test(int argc, char **argv){
         gpuErrchk(cudaMemcpy(dev_impulse_v, impulse_data, impulse_length * sizeof(cufftComplex), 
             cudaMemcpyHostToDevice));
 
-        std::cout << "Helena test 2" << std::endl;
 
 
 
@@ -422,15 +421,12 @@ int large_gauss_test(int argc, char **argv){
         cufftHandle plan;
         /* Create a 1D FFT plan. */ 
         int batch = 1; // Number of transforms to run 
-        std::cout << "Helena test 3" << std::endl;
         cufftPlan1d (&plan, padded_length, CUFFT_C2C, batch); /* Transform the first signal in place, nx is size of fft */ 
-        std::cout << "Helena test 4" << std::endl;
 
         cufftExecC2C (plan, dev_input_data, dev_input_data, CUFFT_FORWARD);
         cufftExecC2C (plan, dev_impulse_v, dev_impulse_v, CUFFT_FORWARD);
 
         // cudaMemcpy (data_back, dev_input_data, NX*sizeof (cufftComplex), cudaMemcpyDeviceIoHost); // we dont need this
-        std::cout << "Helena test 5" << std::endl;
 
 
 
@@ -601,9 +597,12 @@ int large_gauss_test(int argc, char **argv){
         }
 
 
+        cerr << "HELPPPPP" << endl;
+
 
         STOP_RECORD_TIMER(gpu_time_ms_norm);
 
+        cerr << "HELPPPPP2" << endl;
         // For testing purposes only
         gpuErrchk( cudaMemcpy(&max_abs_val_fromGPU, 
             dev_max_abs_val, 1 * sizeof(float), cudaMemcpyDeviceToHost) );
