@@ -39,7 +39,6 @@ cudaProdScaleKernel(const cufftComplex *raw_data, const cufftComplex *impulse_v,
     cufftComplex *out_data,
     int padded_length) {
 
-
     /* TODO: Implement the point-wise multiplication and scaling for the
     FFT'd input and impulse response. 
     (a + bi)(c + di) = (ac - bd) + (ad + bc)i
@@ -101,12 +100,18 @@ cudaMaximumKernel(cufftComplex *out_data, float *max_abs_val,
         compare-float-in-cuda)
 
     */
+   
+    // "This is all wrong, scratch this"
     // extern declare share memory
-    // find max of stride 32  for each thread (# of banks)
-    // write result back to index increment by length of array / num of blocks / 32
+    // divide input by number of threads in grid, so we have a non-consecutive chunk for each thread 
+    // find max of each chunk
+    // (Helena is not an english major ^ she is a ✨stem major✨)
+    // write result back to index increment by length of array / num of blocks / 32 
     // syncthreads()
     // repeat until something is 1 (potentially nice to pad length of array to be power of 2)
     // if threadindex == 0: atomic max (collect max of each block)
+    // sractch all of this, bad idea  :,<
+    //:,< :,< :,< :,< :,< :,< :,< :,< :,< :,<
 
 
     // 1. Declaring shared memory: basically assume for this problem that
@@ -117,7 +122,38 @@ cudaMaximumKernel(cufftComplex *out_data, float *max_abs_val,
     //    - otherwise, move memory from 2*thread_idx and accumulate there
     //    - synchronize
     // 4. Copy stuff back
+
+    // copy from out data global memory to shared_input
+    // const uint length = padded_length;
+    uint num_items_to_process_per_block = blockDim.x;
+    const uint nearest_pow_2 = static_cast<int>(std::pow(2, std::ceil(std::log2(num_items_to_process_per_block * 2))));
+    // __shared__ cufftComplex shm [nearest_pow_2];
+    extern __shared__ cufftComplex shm [];
+    uint thread_index;
+    thread_index = threadIdx.x + blockDim.x * blockIdx.x; // Thread offset within the block?
+
+    // Loop over grids
+    while (thread_index < padded_length) {
+        if (thread_index  + num_items_to_process_per_block >= num_items_to_process_per_block * 2) {
+            shm[thread_index + num_items_to_process_per_block].x = 0;
+        } else {
+            shm[thread_index + num_items_to_process_per_block] = out_data[thread_index + num_items_to_process_per_block];
+        }
+        shm[thread_index] = out_data[thread_index];
     
+        // Loop over the items within the block?
+        while (num_items_to_process_per_block > 1) {
+            float left_magnitude = abs(shm[thread_index].x);
+            float right_magnitude = abs(shm[thread_index + num_items_to_process_per_block].x);
+            float bigger = max(left_magnitude, right_magnitude);
+            //  bigger = shm[thread_index], shm[thread_index + 32]; // stride 32 to avoid bank conflict
+            shm[thread_index].x = bigger;
+            num_items_to_process_per_block = num_items_to_process_per_block / 2;
+            __syncthreads();
+        }
+        atomicMax(max_abs_val, shm[0].x);
+        thread_index += blockDim.x * gridDim.x;
+    }
 }
 
 __global__
@@ -130,6 +166,12 @@ cudaDivideKernel(cufftComplex *out_data, float *max_abs_val,
 
     This kernel should be quite short.
     */
+    uint thread_index;
+    thread_index = threadIdx.x + blockDim.x * blockIdx.x; 
+    while (thread_index < padded_length) {
+        out_data[thread_index].x = out_data[thread_index].x / max_abs_val[0];
+        thread_index += blockDim.x * gridDim.x;
+    }
 
 }
 
