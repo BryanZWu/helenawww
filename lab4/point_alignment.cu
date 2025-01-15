@@ -21,8 +21,24 @@
 
 #define IDX2C(i,j,ld) (((j)*(ld))+(i))
 
+    const char* cusolverGetErrorString(cusolverStatus_t status) {
+    switch (status) {
+        case CUSOLVER_STATUS_SUCCESS: return "CUSOLVER_STATUS_SUCCESS";
+        case CUSOLVER_STATUS_NOT_INITIALIZED: return "CUSOLVER_STATUS_NOT_INITIALIZED";
+        case CUSOLVER_STATUS_ALLOC_FAILED: return "CUSOLVER_STATUS_ALLOC_FAILED";
+        case CUSOLVER_STATUS_INVALID_VALUE: return "CUSOLVER_STATUS_INVALID_VALUE";
+        case CUSOLVER_STATUS_ARCH_MISMATCH: return "CUSOLVER_STATUS_ARCH_MISMATCH";
+        case CUSOLVER_STATUS_MAPPING_ERROR: return "CUSOLVER_STATUS_MAPPING_ERROR";
+        case CUSOLVER_STATUS_EXECUTION_FAILED: return "CUSOLVER_STATUS_EXECUTION_FAILED";
+        case CUSOLVER_STATUS_INTERNAL_ERROR: return "CUSOLVER_STATUS_INTERNAL_ERROR";
+        case CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED: return "CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED";
+        case CUSOLVER_STATUS_NOT_SUPPORTED: return "CUSOLVER_STATUS_NOT_SUPPORTED";
+        case CUSOLVER_STATUS_ZERO_PIVOT: return "CUSOLVER_STATUS_ZERO_PIVOT";
+        case CUSOLVER_STATUS_INVALID_LICENSE: return "CUSOLVER_STATUS_INVALID_LICENSE";
+        default: return "UNKNOWN CUSOLVER ERROR";
+    }
+}
 int main(int argc, char *argv[]) {
-
     if (argc != 4)
     {
         printf("Usage: ./point_alignment [file1.obj] [file2.obj] [output.obj]\n");
@@ -82,8 +98,21 @@ int main(int argc, char *argv[]) {
     cudaMalloc(&dev_xx4x4, 4 * 4 * sizeof(float));
     cudaMalloc(&dev_x1Tx2, num_points * 4 * sizeof(float));
 
-    status = cublasSetMatrix(num_points, 4, sizeof(float), x1mat, 1, dev_x1mat, 1);
-    status = cublasSetMatrix(num_points, 4, sizeof(float), x2mat, 1, dev_x2mat, 1);
+    // for (int i = 0; i < num_points; i++) {
+    //     printf("init matrix %.3f %.3f %.3f %.3f\n", 
+    //            x1mat[i], 
+    //            x1mat[num_points + i], 
+    //            x1mat[2 * num_points + i], 
+    //            x1mat[3 * num_points + i]);
+    // }
+    status = cublasSetMatrix(num_points, 4, sizeof(float), x1mat, num_points, dev_x1mat, num_points);
+    if (status != CUSOLVER_STATUS_SUCCESS) {
+        printf("cublasSetMatrix failed: %s\n", "HELP1");
+    }
+    status = cublasSetMatrix(num_points, 4, sizeof(float), x2mat, num_points, dev_x2mat, num_points);
+     if (status != CUSOLVER_STATUS_SUCCESS) {
+    printf("cublasSetMatrix failed: %s\n", "HELP1");
+    }
     // Now, proceed with the computations necessary to solve for the linear
     // transformation.
 
@@ -98,10 +127,28 @@ int main(int argc, char *argv[]) {
     status = cublasSgemm_v2(
         handle=handle, CUBLAS_OP_T, CUBLAS_OP_N, 4, 4, num_points, &one, dev_x1mat, num_points, dev_x1mat, num_points, &zero, dev_xx4x4, 4
     );
+    if (status != CUSOLVER_STATUS_SUCCESS) {
+    printf("cublasSgemm_v2 failed: %s\n", "HELP1");
+    } else {
+        printf("cublasSgemm_v2 succeeded.\n");
+        // Print the values
+        float *debug = (float *)malloc(4 * 4 * sizeof(float));
+        cudaMemcpy(debug, dev_xx4x4, 4 * 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < 4; i++) {
+        //     for (int j = 0; j < 4; j++) {
+        //         printf("debug1 %f ", debug[i * 4 + j]);
+        //     }
+        // }
+    }
     //   x1Tx2 = Transpose[x1mat] . x2mat
     status = cublasSgemm_v2(
         handle=handle, CUBLAS_OP_T, CUBLAS_OP_N, 4, 4, num_points, &one, dev_x1mat, num_points, dev_x2mat, num_points, &zero, dev_x1Tx2, 4
     );
+        if (status != CUSOLVER_STATUS_SUCCESS) {
+    printf("cublasSgemm_v2 failed: %s\n", "HELP2"); // cudaGetErrorString(status));
+    } else {
+        printf("cublasSgemm_v2 succeeded.\n");
+    }
 
 
     // TODO: Finally, solve the system using LU-factorization! We're solving
@@ -148,10 +195,23 @@ int main(int argc, char *argv[]) {
 
     // TODO: Now, call the factorizer cusolverDnSgetrf, using the above initialized data
     status_cusolver = cusolverDnSgetrf(solver_handle, 4, 4, dev_xx4x4, 4, workspace, pivots, info);
+    if (status_cusolver != CUSOLVER_STATUS_SUCCESS) {
+        printf("buffer HELPPPP");
+    } else {
+        printf("buffer does NOT need HELP");
+    }
+
+    // DEBUG: copy the factorized matrix to the output
+    cudaMemcpy(dev_x1Tx2, dev_xx4x4, 4 * 4 * sizeof(float), cudaMemcpyDeviceToDevice);
 
 
     // TODO: Finally, solve the factorized version using a direct call to cusolverDnSgetrs. This gets written inplace to... B??? dev_x1Tx2?
-    status_cusolver = cusolverDnSgetrs(solver_handle, CUBLAS_OP_N, 4, 4, dev_xx4x4, 4, pivots, dev_x1Tx2, 4, info);
+    // status_cusolver = cusolverDnSgetrs(solver_handle, CUBLAS_OP_N, 4, 4, dev_xx4x4, 4, pivots, dev_x1Tx2, 4, info);
+    // if (status_cusolver != CUSOLVER_STATUS_SUCCESS) {
+    //     printf("solver HELPPPP");
+    // } else {
+    //     printf("solver does NOT need HELP");
+    // }
 
     // TODO: Destroy the cuSolver handle
     status_cusolver = cusolverDnDestroy(solver_handle);
@@ -166,9 +226,9 @@ int main(int argc, char *argv[]) {
 
     // TODO Helena: Don't forget to set the bottom row of the final transformation
     //       to [0,0,0,1] (right-most columns of the transposed matrix)
-    out_transformation[12] = 0;
-    out_transformation[13] = 0;
-    out_transformation[14] = 0;
+    out_transformation[3] = 0;
+    out_transformation[7] = 0;
+    out_transformation[11] = 0;
     out_transformation[15] = 1;
 
     // Print transformation in row order.
@@ -186,10 +246,13 @@ int main(int argc, char *argv[]) {
     // TODO Allocate and Initialize data matrix
     float * dev_pt;
     cudaMalloc(&dev_pt, num_points * sizeof(float) * point_dim);
+    cudaMemcpy(dev_pt, out_transformation, point_dim * num_points * sizeof(float), cudaMemcpyHostToDevice);
 
     // TODO Allocate and Initialize transformation matrix
     float * dev_trans_mat;
     cudaMalloc(&dev_trans_mat, sizeof(float) * 16);
+    cudaMemcpy(dev_trans_mat, out_transformation, 16 * sizeof(float), cudaMemcpyHostToDevice);
+
 
     // TODO Allocate and Initialize transformed points
     float * dev_trans_pt;
@@ -201,9 +264,13 @@ int main(int argc, char *argv[]) {
     // TODO Transform point matrix
     //          (4x4 trans_mat) . (nx4 pointzx matrix)^T = (4xn transformed points)
     printf("compute point transformation\n");
-    // status = cublasSgemm_v2(
-    //     handle=handle, CUBLAS_OP_N, CUBLAS_OP_T, num_points, 4, 4, &one_d, dev_trans_mat, 4, num_points, 4, &zero_d, dev_trans_pt, num_points
-    // );
+    status = cublasSgemm_v2(
+        handle=handle, CUBLAS_OP_N, CUBLAS_OP_T, 4, num_points, 4,
+        &one_d, dev_trans_mat, 4,
+        dev_pt, num_points, &one_d,
+        dev_trans_pt, num_points
+    );
+    
 
     // So now dev_trans_pt has shape (4 x n)
     float * trans_pt; 
@@ -242,5 +309,7 @@ int main(int argc, char *argv[]) {
     free(out_transformation);
     free(x1mat);
     free(x2mat);
+
+
 }
 
