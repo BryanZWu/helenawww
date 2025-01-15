@@ -267,12 +267,13 @@ int main(int argc, char *argv[]) {
     status = cublasSgemm_v2(
         handle=handle, CUBLAS_OP_N, CUBLAS_OP_T, 4, num_points, 4,
         &one_d, dev_trans_mat, 4,
-        dev_pt, num_points, &one_d,
+        dev_pt, num_points, &zero_d,
         dev_trans_pt, num_points
     );
+    printf("compute done\n");
     
-
     // So now dev_trans_pt has shape (4 x n)
+
     float * trans_pt; 
     trans_pt = (float *)malloc(num_points * 4 * sizeof(float));
     cudaMemcpy(trans_pt, dev_trans_pt, num_points * 4 * sizeof(float), cudaMemcpyDeviceToHost);
@@ -293,22 +294,23 @@ int main(int argc, char *argv[]) {
     ///////////////////////////////////////////////////////////////////////////
 
     // TODO: Free GPU memory
-    free(dev_pt);
-    free(dev_trans_mat);
-    free(dev_trans_mat);
-    free(pivots);
-    free(info);
-    free(workspace);
-    free(dev_x1mat);
-    free(dev_x2mat);
-    free(dev_xx4x4);
-    free(dev_x1Tx2);
+    cudaFree(dev_pt);
+    cudaFree(dev_trans_mat);
+    cudaFree(dev_trans_mat);
+    cudaFree(pivots);
+    cudaFree(info);
+    cudaFree(workspace);
+    cudaFree(dev_x1mat);
+    cudaFree(dev_x2mat);
+    cudaFree(dev_xx4x4);
+    cudaFree(dev_x1Tx2);
 
 
     // TODO: Free CPU memory
     free(out_transformation);
     free(x1mat);
     free(x2mat);
+    printf("done freeing memory rip");
 
 
 }
