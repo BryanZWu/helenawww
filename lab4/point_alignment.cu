@@ -75,6 +75,7 @@ int main(int argc, char *argv[]) {
 
     // TODO: Allocate device memory and copy over the data onto the device
     // Hint: Use cublasSetMatrix() for copying
+    printf("allocating memory\n");
 
     cudaMalloc(&dev_x1mat, num_points * 4 * sizeof(float));
     cudaMalloc(&dev_x2mat, num_points * 4 * sizeof(float));
@@ -93,13 +94,13 @@ int main(int argc, char *argv[]) {
     // TODO: First calculate xx4x4 and x1Tx2
     // Following two calls should correspond to:
     //   xx4x4 = Transpose[x1mat] . x1mat
-    // TOOD Someone wants to make this column major eek run away
+    printf("starting to calculate xx4x4\n");
     status = cublasSgemm_v2(
-        handle=handle, CUBLAS_OP_T, CUBLAS_OP_N, 4, 4, 4, &one, dev_x1mat, 4, dev_x1mat, 4, &zero, dev_xx4x4, 4
+        handle=handle, CUBLAS_OP_T, CUBLAS_OP_N, 4, 4, num_points, &one, dev_x1mat, num_points, dev_x1mat, num_points, &zero, dev_xx4x4, 4
     );
     //   x1Tx2 = Transpose[x1mat] . x2mat
     status = cublasSgemm_v2(
-        handle=handle, CUBLAS_OP_T, CUBLAS_OP_N, 4, 4, 4, &one, dev_x1mat, 4, dev_x2mat, 4, &zero, dev_x1Tx2, 4
+        handle=handle, CUBLAS_OP_T, CUBLAS_OP_N, 4, 4, num_points, &one, dev_x1mat, num_points, dev_x2mat, num_points, &zero, dev_x1Tx2, 4
     );
 
 
@@ -129,7 +130,7 @@ int main(int argc, char *argv[]) {
 
 
 
-    
+    printf("compute buffer size\n");
     // TODO: compute buffer size and prepare memory
     status_cusolver = cusolverDnSgetrf_bufferSize(solver_handle, 4, 4, dev_xx4x4, 4, &Lwork);
 
@@ -199,9 +200,10 @@ int main(int argc, char *argv[]) {
 
     // TODO Transform point matrix
     //          (4x4 trans_mat) . (nx4 pointzx matrix)^T = (4xn transformed points)
-    status = cublasSgemm_v2(
-        handle=handle, CUBLAS_OP_N, CUBLAS_OP_T, num_points, 4, 4, &one_d, dev_trans_mat, 4, dev_pt, 4, &zero_d, dev_trans_pt, num_points
-    );
+    printf("compute point transformation\n");
+    // status = cublasSgemm_v2(
+    //     handle=handle, CUBLAS_OP_N, CUBLAS_OP_T, num_points, 4, 4, &one_d, dev_trans_mat, 4, num_points, 4, &zero_d, dev_trans_pt, num_points
+    // );
 
     // So now dev_trans_pt has shape (4 x n)
     float * trans_pt; 
