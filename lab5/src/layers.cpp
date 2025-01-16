@@ -229,7 +229,8 @@ Input::Input(int n, int c, int h, int w,
 {
     // TODO (set 5): set output tensor descriptor out_shape to have format
     //               NCHW, be floats, and have dimensions n, c, h, w
-
+    cudnnCreateTensorDescriptor(&out_shape);
+    cudnnSetTensor4dDescriptor(out_shape, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w);
     allocate_buffers();
 }
 
@@ -295,11 +296,22 @@ Dense::~Dense()
 void Dense::forward_pass()
 {
     float one = 1.0, zero = 0.0;
-
+ 
     // TODO (set 5): out_batch = weights^T * in_batch (without biases)
+    // Weights: (input, output)
+    // in_batch: (input, batch)
+    // Output(out_batch): (output, batch)
+    CUBLAS_CALL( cublasSgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+        out_size, batch_size, this->in_size, // m, n, k: out_size, batch, in_size
+        &one,// alpha 
+        weights, in_size,// matrix a, lda, num rows
+        in_batch, in_size, // matrix b, ldb
+        &zero, // beta--no output accumulation
+        out_batch, out_size) );
 
     // out_batch += bias * 1_vec^T (to distribute bias to all outputs in
     // this minibatch of data)
+    // onevec: (batch) 
     CUBLAS_CALL( cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
         out_size, batch_size, 1,
         &one,
@@ -318,9 +330,17 @@ void Dense::forward_pass()
 void Dense::backward_pass(float learning_rate)
 {
     float one = 1.0, zero = 0.0;
-
+    // in_batch: (input, batch)
+    // grad_out_batch = (out_size, )
     // TODO (set 5): grad_weights = in_batch * (grad_out_batch)^T
-
+    // CUBLAS_CALL( cublasSgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+    //     out_size, batch_size, this->in_size, // m, n, k: out_size, batch, in_size
+    //     &one,// alpha 
+    //     in_batch, ,// matrix a, lda, num rows
+    //     grad_out_batch, out_size, // matrix b, ldb
+    //     &zero, // beta--no output accumulation
+    //     grad_weights, ) );
+        
     // grad_biases = grad_out_batch * 1_vec
     CUBLAS_CALL( cublasSgemv(cublasHandle, CUBLAS_OP_N,
         out_size, batch_size,
