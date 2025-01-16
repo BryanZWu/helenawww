@@ -331,16 +331,16 @@ void Dense::backward_pass(float learning_rate)
 {
     float one = 1.0, zero = 0.0;
     // in_batch: (input, batch)
-    // grad_out_batch = (out_size, )
+    // grad_out_batch = (out_size, batch_size)
     // TODO (set 5): grad_weights = in_batch * (grad_out_batch)^T
-    // CUBLAS_CALL( cublasSgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
-    //     out_size, batch_size, this->in_size, // m, n, k: out_size, batch, in_size
-    //     &one,// alpha 
-    //     in_batch, ,// matrix a, lda, num rows
-    //     grad_out_batch, out_size, // matrix b, ldb
-    //     &zero, // beta--no output accumulation
-    //     grad_weights, ) );
-        
+    CUBLAS_CALL( cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
+        in_size, out_size, batch_size, // m, n, k: mxn is result while k is the shared dim
+        &one,// alpha 
+        in_batch, in_size,// matrix a, lda, num rows
+        grad_out_batch, out_size, // matrix b, ldb
+        &zero, // beta--no output accumulation
+        grad_weights, in_size) );
+
     // grad_biases = grad_out_batch * 1_vec
     CUBLAS_CALL( cublasSgemv(cublasHandle, CUBLAS_OP_N,
         out_size, batch_size,
@@ -353,13 +353,46 @@ void Dense::backward_pass(float learning_rate)
     // TODO (set 5): grad_in_batch = W * grad_out_batch
     // Note that grad_out_batch is the next layer's grad_in_batch, and
     // grad_in_batch is the previous layer's grad_out_batch
-
+    // Weights: (input, output)
+    // grad_out_batch: (output, batch)
+    CUBLAS_CALL( cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+        in_size, batch_size, out_size, // m, n, k: mxn is result while k is the shared dim
+        &one,// alpha 
+        weights, in_size,// matrix a, lda, num rows
+        grad_out_batch, out_size, // matrix b, ldb
+        &zero, // beta--no output accumulation
+        grad_in_batch, in_size) );
     // Descend along the gradients of weights and biases using cublasSaxpy
     float eta = -learning_rate;
-
+    // grad_weights (in_dim, out_dim)
     // TODO (set 5): weights = weights + eta * grad_weights
+    // C=α⋅A+β⋅B
+    CUBLAS_CALL( cublasSgeam(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+        in_size, out_size, // m, n
+        &eta,// alpha 
+        grad_weights, in_size,// matrix a, lda
+        &one, // beta--accumulate output here for weights!
+        weights, in_size, // matrix b, ldb
+        weights, in_size) );
 
+    // CUBLAS_CALL( cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+    //     in_size, batch_size, out_size, // m, n, k: mxn is result while k is the shared dim
+    //     &eta,// alpha 
+    //     onevec, in_size,// matrix a, lda, num rows
+    //     grad_weights, out_size, // matrix b, ldb
+    //     &one, // beta--accumulate output here for weights!
+    //     weights, in_size) );
+    
+    // Bias: (output_dim)
     // TODO (set 5): biases = biases + eta * grad_biases
+    // C=α⋅A+β⋅B
+    CUBLAS_CALL( cublasSgeam(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+        out_size, 1, // m, n
+        &eta,// alpha 
+        grad_biases, out_size,// matrix a, lda
+        &one, // beta--accumulate output here for weights!
+        biases, out_size, // matrix b, ldb
+        biases, out_size) );
 }
 
 /******************************************************************************/
