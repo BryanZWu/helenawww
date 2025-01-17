@@ -411,19 +411,31 @@ Activation::Activation(Layer *prev, cudnnActivationMode_t activationMode,
     int n, c, h, w, nStride, cStride, hStride, wStride;
 
     // TODO (set 5): get descriptor of input minibatch, in_shape
-
+    cudnnTensorDescriptor_t desc;
+    CUDNN_CALL( cudnnGetTensor4dDescriptor(
+        in_shape,
+        &dtype,
+        &n, &c, &h, &w, &nStride, &cStride, &hStride, &wStride) );
     // TODO (set 5): set descriptor of output minibatch, out_shape, to have the
     //               same parameters as in_shape and be ordered NCHW
-
+    CUDNN_CALL( cudnnSetTensor4dDescriptor(out_shape, CUDNN_TENSOR_NCHW,
+            dtype, n, c, h, w) );
     allocate_buffers();
 
     // TODO (set 5): create activation descriptor, and set it to have the given
     //               activationMode, propagate NaN's, and have coefficient coef
+    CUDNN_CALL(cudnnCreateActivationDescriptor(&activation_desc));
+    CUDNN_CALL(cudnnSetActivationDescriptor(
+        activation_desc,
+        activationMode,
+        CUDNN_PROPAGATE_NAN,
+        coef));
 }
 
 Activation::~Activation()
 {
     // TODO (set 5): destroy the activation descriptor
+    CUDNN_CALL(cudnnDestroyActivationDescriptor(activation_desc));
 }
 
 /**
@@ -435,6 +447,18 @@ void Activation::forward_pass()
     float one = 1.0, zero = 0.0;
 
     // TODO (set 5): apply activation, i.e. out_batch = activation(in_batch)
+    // Computes tensor x = alpha[0] * theta(z) + beta[0] * x, where theta is activation
+    CUDNN_CALL(
+        cudnnActivationForward(
+        cudnnHandle,
+        activation_desc,
+        &one,
+        in_shape,
+        this->in_batch,
+        &zero,
+        out_shape,
+        this->out_batch)
+    );
 }
 
 /**
@@ -448,6 +472,25 @@ void Activation::backward_pass(float learning_rate)
     float one = 1.0, zero = 0.0;
 
     // TODO (set 5): do activation backwards, i.e. compute grad_in_batch
+    // dz = alpha[0] * ∇z(theta^(l−1)(z)) * dx + beta[0] * dz
+    // dloss/dz = dloss/dx * dx/dz 
+    // the second term is the gradient of the activation
+    CUDNN_CALL(
+        cudnnActivationBackward(
+        cudnnHandle,
+        activation_desc,
+        &one,
+        out_shape,
+        this->out_batch,
+        out_shape,
+        this->grad_out_batch,
+        in_shape,
+        this->in_batch,
+        &zero,
+        in_shape, 
+        this->grad_in_batch
+        )
+    );
 }
 
 /******************************************************************************/
@@ -669,10 +712,16 @@ SoftmaxCrossEntropy::SoftmaxCrossEntropy(Layer *prev,
 
     // TODO (set 5): get descriptor of input minibatch, in_shape, into variables
     //               declared above
+    CUDNN_CALL(
+        cudnnGetTensor4dDescriptor(
+            in_shape, &dtype, &n, &c, &h, &w, &nStride, &cStride, &hStride, &wStride
+        )
+    );
 
     // TODO (set 5): set descriptor of output minibatch, out_shape, to have the
     //               same parameters as in_shape and be ordered NCHW
-
+    CUDNN_CALL(cudnnSetTensor4dDescriptor(out_shape, CUDNN_TENSOR_NCHW,
+            dtype, n, c, h, w ));
     allocate_buffers();
 }
 
@@ -684,6 +733,18 @@ void SoftmaxCrossEntropy::forward_pass()
 
     // TODO (set 5): do softmax forward pass using accurate softmax and
     //               per instance mode. store result in out_batch.
+    // x = alpha[0] * softmax(z) + beta[0] * x
+    CUDNN_CALL(cudnnSoftmaxForward(
+        cudnnHandle,
+        CUDNN_SOFTMAX_ACCURATE,
+        CUDNN_SOFTMAX_MODE_INSTANCE,
+        &one,
+        in_shape,
+        this->in_batch,
+        &zero,
+        out_shape,
+        this->out_batch
+    ));
 }
 
 /**
@@ -703,12 +764,18 @@ void SoftmaxCrossEntropy::backward_pass(float lr)
     //               = out_batch         - grad_out_batch
     // all have a length equal to "size" variable defined above
     float minus_one = -1.0;
+    int one = 1;
 
     // TODO (set 5): first, copy grad_in_batch = out_batch
+    cudaMemcpy(grad_in_batch, out_batch, size * sizeof(float), cudaMemcpyDeviceToDevice);
+
 
     // TODO (set 5): set grad_in_batch = grad_in_batch - grad_out_batch using
     //               cublasSaxpy
-
+    CUBLAS_CALL( cublasSaxpy_v2(cublasHandle, size,
+                           &minus_one,
+                           grad_out_batch, 1,
+                           grad_in_batch, 1));
     // normalize the gradient by the batch size (do it once in the beginning, so
     // we don't have to worry about it again later)
     float scale = 1.0f / static_cast<float>(n);
