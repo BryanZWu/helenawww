@@ -131,6 +131,7 @@ public:
             return 1;
         }
 
+        printf("HELP value: %d\n", value);
         assert(__builtin_bswap32(value) == 0x00000803);
         if (verbose)
             printf("Image Magic        :%0X%I32u\n",

@@ -16,7 +16,7 @@ int main(int argc, char **argv)
     std::string activation = "relu";
 
     // Directory in which training and testing data are stored (default is this)
-    std::string dirname = "/srv/cs179_mnist";
+    std::string dirname = "/home/bryan_diffuse_bio/helenawww/lab5/data";
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i)
@@ -35,7 +35,7 @@ int main(int argc, char **argv)
                 activation = argv[i];
         }
     }
-
+    dirname = "/home/bryan_diffuse_bio/helenawww/lab5/data";
     // Load training set
     int n_train, c, h, w, n_classes;
     float *train_X, *train_Y;
