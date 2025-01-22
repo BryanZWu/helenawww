@@ -1,11 +1,11 @@
 # torch equivalent:
 from jax import numpy as jnp
 import jax
-import torch
 import math
 from reference import scaled_dot_product, sdpa_with_mha_and_mask, triangle_attn
 
 B, N, D = 2, 256, 128
+print("JAX devices:", jax.devices())
 
 @jax.jit
 def vanilla_attention_forward(q, k, v):
@@ -13,7 +13,7 @@ def vanilla_attention_forward(q, k, v):
     # attn_out = Q @ K^T / sqrt(D)
     ...
     D = q.shape[-1] # its fine just push the code to edit locally
-    return q @ k^T / sqrt(D)
+    return q @ k.T / math.sqrt(D)
 
 def main(): 
     # First, make sure that the vanilla attention forward pass works
