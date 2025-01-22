@@ -10,10 +10,14 @@ print("JAX devices:", jax.devices())
 @jax.jit
 def vanilla_attention_forward(q, k, v):
     # Implement the vanilla attention forward pass: 
-    # attn_out = Q @ K^T / sqrt(D)
+    # attn_out = softmax(Q @ K^T) / sqrt(D)
     ...
-    D = q.shape[-1] # its fine just push the code to edit locally
-    return q @ k.T / math.sqrt(D)
+    D = q.shape[-1] 
+    # k dimension: (2, 256, 128), we want 2, 128, 256
+    transposed_k = jnp.transpose(k, (0, 2, 1)) 
+    softmax = jax.nn.softmax(q @ transposed_k  / math.sqrt(D), axis=-1) # for each query, the similar scores for all keys should sum to 1
+    out = jnp.matmul(softmax, v)# apply to v
+    return out
 
 def sdpa_with_mha_and_mask(q, k, v, mask, num_heads):
     # Q2: two really important items in attention is the mask and 
