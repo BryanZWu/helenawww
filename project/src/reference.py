@@ -32,6 +32,8 @@ def sdpa_with_mha_and_mask_solution(q, k, v, mask=None, num_heads=8):
     attn_logits = jnp.matmul(q, jnp.swapaxes(k, -2, -1))
     attn_logits = attn_logits / math.sqrt(d_k)
     if mask is not None:
+        # Reshape mask to [B, 1, N, N] to broadcast across heads
+        mask = mask[:, None, :, :] if mask.ndim == 3 else mask
         attn_logits = jnp.where(mask == 0, -9e15, attn_logits)
     attention = jax.nn.softmax(attn_logits, axis=-1)
     values = jnp.matmul(attention, v)
