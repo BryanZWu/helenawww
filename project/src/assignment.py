@@ -2,7 +2,7 @@
 from jax import numpy as jnp
 import jax
 import math
-from reference import scaled_dot_product_solution, sdpa_with_mha_and_mask_solution, triangle_attn_solution
+from reference import scaled_dot_product_solution, sdpa_with_mha_and_mask_solution, triangle_attn_solution, triangle_attn_with_mha_solution
 
 B, N, D = 2, 256, 128
 print("JAX devices:", jax.devices())
@@ -185,6 +185,16 @@ def main():
     expected3 = triangle_attn_solution(q_triangle, k_triangle, v_triangle)
     assert jnp.allclose(out3, expected3)
     print("Q3 is good!")
+
+    expected4 = triangle_attn_with_mha_solution(q_triangle, k_triangle, v_triangle)
+    out4 = triangle_attn_with_mha(q_triangle, k_triangle, v_triangle)
+    assert jnp.allclose(out4, expected4)
+    print("Q4 is good!")
+
+    expected5 = triangle_attn_with_mha_solution(q_triangle, k_triangle, v_triangle, from_starting_node=False)
+    out5 = triangle_attn_with_mha(q_triangle, k_triangle, v_triangle, from_starting_node=False)
+    assert jnp.allclose(out5, expected5)
+    print("Q5 is good!")
 
     
     return

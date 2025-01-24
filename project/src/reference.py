@@ -117,24 +117,25 @@ def triangle_attention_with_mha_solution(q, k, v, from_starting_node=True):
     return attn_out
 
 
-B, N, N, D = 2, 256, 256, 128
+if __name__ == "__main__":
+    B, N, N, D = 2, 256, 256, 128
 
-key = jax.random.PRNGKey(0)
-q = jax.random.uniform(key, (B, N, D))
-k = jax.random.uniform(key, (B, N, D))
-v = jax.random.uniform(key, (B, N, D))
-expected1 = scaled_dot_product_solution(q, k, v)
+    key = jax.random.PRNGKey(0)
+    q = jax.random.uniform(key, (B, N, D))
+    k = jax.random.uniform(key, (B, N, D))
+    v = jax.random.uniform(key, (B, N, D))
+    expected1 = scaled_dot_product_solution(q, k, v)
 
-# Q2
-mask = jax.random.uniform(key, (B, N, N)) > 0.5
-expected2 = sdpa_with_mha_and_mask_solution(q, k, v, mask=mask)
+    # Q2
+    mask = jax.random.uniform(key, (B, N, N)) > 0.5
+    expected2 = sdpa_with_mha_and_mask_solution(q, k, v, mask=mask)
 
-# Q3
-q_triangle = jax.random.uniform(key, (B, N, N, D))
-k_triangle = jax.random.uniform(key, (B, N, N, D))
-v_triangle = jax.random.uniform(key, (B, N, N, D))
-expected3 = triangle_attn_solution(q_triangle, k_triangle, v_triangle)
+    # Q3
+    q_triangle = jax.random.uniform(key, (B, N, N, D))
+    k_triangle = jax.random.uniform(key, (B, N, N, D))
+    v_triangle = jax.random.uniform(key, (B, N, N, D))
+    expected3 = triangle_attn_solution(q_triangle, k_triangle, v_triangle)
 
-# Q4
-expected4 = triangle_attention_with_mha_solution(q_triangle, k_triangle, v_triangle)
-expected5 = triangle_attention_with_mha_solution(q_triangle, k_triangle, v_triangle, from_starting_node=False)
+    # Q4
+    expected4 = triangle_attention_with_mha_solution(q_triangle, k_triangle, v_triangle)
+    expected5 = triangle_attention_with_mha_solution(q_triangle, k_triangle, v_triangle, from_starting_node=False)
