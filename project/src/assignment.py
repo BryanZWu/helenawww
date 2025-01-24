@@ -19,15 +19,27 @@ def vanilla_attention_forward(q, k, v):
     out = jnp.matmul(softmax, v)# apply to v
     return out
 
-def sdpa_with_mha_and_mask(q, k, v, mask, num_heads):
-    # Q2: two really important items in attention is the mask and 
-    # multi-head attention. 
-    # The mask is a (B, N, N) tensor where each element is either 0 or 1,
-    # for whether the node is allowed to "look up" another node. THis is 
-    # useful in autoregresive modeling (where a word can only see words before 
-    # it in the sequence).
-    # Multi-head attention is simply having different sets of QKV that can 
-    # each compute its own attention matrix and handle a different concept.
+@jax.jit
+def sdpa_with_mha_and_mask(q, k, v, mask=None):
+    """
+    Q2: two really important items in attention is the mask and 
+    multi-head attention. 
+    The mask is a (B, N, N) tensor where each element is either 0 or 1,
+    for whether the node is allowed to "look up" another node. THis is 
+    useful in autoregresive modeling (where a word can only see words before 
+    it in the sequence).
+    Multi-head attention is simply having different sets of QKV that can 
+    each compute its own attention matrix and handle a different concept.
+    """
+
+    # For this problem, assume each head has 64 dims
+    B, N, D = q.shape
+    # Assume D is divisible by num_heads, common in transformer architectures
+    # This makes num_heads implicit in the input shape
+    num_heads = D // 64  # standard head_dim is usually 64
+    head_dim = D // num_heads
+    assert head_dim * num_heads == D
+
     D = q.shape[-1] # split d by num of heads
     # k dimension: (2, 256, 128), we want 2, 128, 256
     # convert BxNxD to Bxnum_headsxNxquery_dim, where query_dim = D/num_heads

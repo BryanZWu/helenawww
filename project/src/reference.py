@@ -2,6 +2,7 @@
 from jax import numpy as jnp
 import jax
 import math
+from functools import partial
 
 
 @jax.jit
@@ -19,9 +20,13 @@ def scaled_dot_product_solution(q, k, v, mask=None):
     return values
 
 @jax.jit
-def sdpa_with_mha_and_mask_solution(q, k, v, mask=None, num_heads=8):
+def sdpa_with_mha_and_mask_solution(q, k, v, mask=None):
     B, N, D = q.shape
+    # Assume D is divisible by num_heads, common in transformer architectures
+    # This makes num_heads implicit in the input shape
+    num_heads = D // 64  # standard head_dim is usually 64
     head_dim = D // num_heads
+    assert head_dim * num_heads == D
     # split into heads
     q = q.reshape(B, N, num_heads, head_dim).transpose(0, 2, 1, 3)
     k = k.reshape(B, N, num_heads, head_dim).transpose(0, 2, 1, 3)
@@ -60,12 +65,11 @@ key = jax.random.PRNGKey(0)
 q = jax.random.uniform(key, (B, N, D))
 k = jax.random.uniform(key, (B, N, D))
 v = jax.random.uniform(key, (B, N, D))
-print(q, k, v)
 expected1 = scaled_dot_product_solution(q, k, v)
 
 # Q2
 mask = jax.random.uniform(key, (B, N, N)) > 0.5
-expected2 = sdpa_with_mha_and_mask_solution(q, k, v, mask=mask, num_heads=8)
+expected2 = sdpa_with_mha_and_mask_solution(q, k, v, mask=mask)
 
 # Q3
 q_triangle = jax.random.uniform(key, (B, N, N, D))
