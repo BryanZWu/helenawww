@@ -90,13 +90,56 @@ def triangle_attn(q, k, v):
     # Return the (B, N, N, D) output
     return out
 
-def triangle_attn_with_mha(q, k, v, num_heads):
-    # Q4
-    # Implement the triangle attention forward pass with multi-head attention: 
-    # Q K V are each of shape (B, N, N, D)
-    # For this first part, let's only do triangle attention on
-    # the starting node
+@jax.jit
+def triangle_attn_with_mha(q, k, v, from_starting_node=True):
+    """Q4: Triangle Attention with Multi-Head Attention
+    
+    This is an extension of Q3 where we add multi-head attention to triangle attention.
+    """
+    B, N, N, D = q.shape
+    head_dim = 64
+    num_heads = D // head_dim
+    assert head_dim * num_heads == D
+    # Pull out the head dimension from D, and combine it with the batch dimension
     ...
+
+    # Triangle attention matmul is slightly different between from_starting_node and not
+    def qkv_shapes_from_starting_node(args):
+        q, k, v = args
+        ...
+        return q, k, v
+    def qkv_shapes_from_ending_node(args):
+        q, k, v = args
+        ...
+        return q, k, v
+    q, k, v = jax.lax.cond(
+        from_starting_node,
+        qkv_shapes_from_starting_node,
+        qkv_shapes_from_ending_node,
+        (q, k, v)
+    )
+    
+    # Create attention logits
+    attn_logits = ...
+    # apply softmax
+    attn_score = ...
+
+    # apply to values
+    attn_out = ...
+    
+    # Now that matmul is done, restore the (B * n_heads, n_from, n_to, head_dim) ordering
+    attn_out = jax.lax.cond(
+        from_starting_node,
+        lambda x: ...,
+        lambda x: ...,
+        attn_out,
+    )
+
+    # Pull out the n heads and put it back into D
+    attn_out = ...
+
+    
+    return attn_out
 
 def main(): 
     # First, make sure that the vanilla attention forward pass works
