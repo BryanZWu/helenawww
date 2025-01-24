@@ -53,3 +53,22 @@ def triangle_attn_solution(q, k, v):
     attn_score = jax.nn.softmax(attn_logits, axis=-1)
     attn_out = jnp.matmul(attn_score, v) # B, N_f, N_t, D
     return attn_out
+
+B, N, N, D = 2, 256, 256, 128
+
+key = jax.random.PRNGKey(0)
+q = jax.random.uniform(key, (B, N, D))
+k = jax.random.uniform(key, (B, N, D))
+v = jax.random.uniform(key, (B, N, D))
+print(q, k, v)
+expected1 = scaled_dot_product_solution(q, k, v)
+
+# Q2
+mask = jax.random.uniform(key, (B, N, N)) > 0.5
+expected2 = sdpa_with_mha_and_mask_solution(q, k, v, mask=mask, num_heads=8)
+
+# Q3
+q_triangle = jax.random.uniform(key, (B, N, N, D))
+k_triangle = jax.random.uniform(key, (B, N, N, D))
+v_triangle = jax.random.uniform(key, (B, N, N, D))
+expected3 = triangle_attn_solution(q_triangle, k_triangle, v_triangle)

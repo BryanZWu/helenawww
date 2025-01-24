@@ -78,6 +78,14 @@ def triangle_attn(q, k, v):
     # Return the (B, N, N, D) output
     return out
 
+def triangle_attn_with_mha(q, k, v, num_heads):
+    # Q4
+    # Implement the triangle attention forward pass with multi-head attention: 
+    # Q K V are each of shape (B, N, N, D)
+    # For this first part, let's only do triangle attention on
+    # the starting node
+    ...
+
 def main(): 
     # First, make sure that the vanilla attention forward pass works
     # is it this command pip install -U "jax[cuda12]" torch? ohkay
@@ -102,8 +110,11 @@ def main():
     print("Q2 is good!")
 
     # Q3
-    out3 = triangle_attn(q, k, v)
-    expected3 = triangle_attn_solution(q, k, v)
+    q_triangle = jax.random.uniform(key, (B, N, N, D))
+    k_triangle = jax.random.uniform(key, (B, N, N, D))
+    v_triangle = jax.random.uniform(key, (B, N, N, D))
+    out3 = triangle_attn(q_triangle, k_triangle, v_triangle)
+    expected3 = triangle_attn_solution(q_triangle, k_triangle, v_triangle)
     assert jnp.allclose(out3, expected3)
     print("Q3 is good!")
 
