@@ -58,23 +58,21 @@ def triangle_attn(q, k, v):
     # from(N_f)-to(N_t) pair, here is a N_t attention score corresponding "
     # to each of the N_t nodes that also start at N_f.
     D = q.shape[-1] 
-    expanded_q = jnp.expand_dims(q, axis=2)  # Shape becomes (b, n, 1, d)
-    expanded_q = jnp.broadcast_to(expanded_q, (B, N, N, D))  # Shape becomes (b, n, n, d)
-    expanded_k = jnp.expand_dims(k, axis=2)  
-    expanded_k = jnp.broadcast_to(expanded_k, (B, N, N, D)) 
+    # expanded_q = jnp.expand_dims(q, axis=2)  # Shape becomes (b, n, 1, d)
+    # expanded_q = jnp.broadcast_to(expanded_q, (B, N, N, D))  # Shape becomes (b, n, n, d)
+    # expanded_k = jnp.expand_dims(k, axis=2)  
+    # expanded_k = jnp.broadcast_to(expanded_k, (B, N, N, D)) 
     # k dimension: (2, 256, 256, 128), we want 2, 256, 128, 256
-    transposed_k = jnp.transpose(expanded_k, (0, 1, 3, 2)) 
+    transposed_k = jnp.transpose(k, (0, 1, 3, 2)) 
     # Apply softmax to the attention scores
-    softmax = jax.nn.softmax(expanded_q @ transposed_k  / math.sqrt(D), axis=2) # for each query, the similar scores for all keys should sum to 1
+    softmax = jax.nn.softmax(q @ transposed_k  / math.sqrt(D), axis=2) # for each query, the similar scores for all keys should sum to 1
     
 
     # Apply the attention scores to the values
     # This logically translates to "For each item B in the batch, for each
     # from(N_f)-to(N_t) pair, apply the N_t attention scores to the N_t values
     # that also start at N_f.
-    expanded_v = jnp.expand_dims(q, axis=2)  # Shape becomes (b, n, 1, d)
-    expanded_v = jnp.broadcast_to(expanded_q, (B, N, N, D))  # Shape becomes (b, n, n, d)
-    out = jnp.matmul(softmax, expanded_v)# apply to v
+    out = jnp.matmul(softmax, v)# apply to v
     # Return the (B, N, N, D) output
     return out
 
@@ -84,7 +82,19 @@ def triangle_attn_with_mha(q, k, v, num_heads):
     # Q K V are each of shape (B, N, N, D)
     # For this first part, let's only do triangle attention on
     # the starting node
-    ...
+    # convert B x N x N x D to Bx num_heads x N x N x query_dim, where query_dim = D/num_heads
+    query_dim = D//num_heads
+    
+    q = q.reshape(B, N, N, num_heads, query_dim).transpose(0, 3, 1, 2, 4)
+    k = k.reshape(B, N, num_heads, query_dim).transpose(0, 2, 1, 3) #  B x num_heads x N x query_dim
+    attn = q @ k.transpose(0, 1, 3, 2)  #  K.t should be Bxnum_headsxquery_dimxN
+    mask_expanded = jnp.expand_dims(mask, axis=1)
+    masked = attn + mask_expanded # apply mask, cant be multipication since 0 matters in softmax
+    softmax = jax.nn.softmax(masked / math.sqrt(D), axis=-1) # for each query, the similar scores for all keys should sum to 1
+    v_reshaped = v.reshape(B, N, num_heads, query_dim) 
+    v_transpose = v_reshaped.transpose(0, 2, 1, 3)
+    out = jnp.matmul(softmax, v_transpose)# apply to v
+    return out
 
 def main(): 
     # First, make sure that the vanilla attention forward pass works
