@@ -1,9 +1,10 @@
 # Verifying the correctness of the custom triangle attention kernel
+import time
 from jax import lax, jit, numpy as jnp
 import jax
 import math
 @jax.jit
-def triangle_attention_with_mha_solution(q, k, v, attention_mask, from_starting_node=True):
+def triangle_attention_reference_implementation(q, k, v, attention_mask, from_starting_node=True):
     """
     This is the reference implementation of the triangle attention with MHA,
     against which we will verify the correctness of our custom kernel.
@@ -74,3 +75,31 @@ def triangle_attention_with_mha_solution(q, k, v, attention_mask, from_starting_
     attn_out = attn_out.reshape(B, N, N, D)
     return attn_out
 
+@jax.jit
+def triangle_attention_custom_kernel(q, k, v, attention_mask, from_starting_node=True):
+    # temporary:
+    return triangle_attention_reference_implementation(q, k, v, attention_mask, from_starting_node)
+
+    # TODO
+
+if __name__ == "__main__":
+    key = jax.random.PRNGKey(0)
+    Ns = [2 ** i for i in range(5, 10)]
+    D = 256
+    times = []
+    for N in Ns:
+        q = jax.random.normal(key, (1, N, N, D))
+        k = jax.random.normal(key, (1, N, N, D))
+        v = jax.random.normal(key, (1, N, N, D))
+        attention_mask = jnp.ones((1, N, N, N))
+        start = time.time()
+        out1 = triangle_attention_reference_implementation(q, k, v, attention_mask)
+        end = time.time()
+        times.append(end - start)
+        start = time.time()
+        out2 = triangle_attention_custom_kernel(q, k, v, attention_mask)
+        end = time.time()
+        times.append(end - start)
+        assert jnp.allclose(out1, out2)
+    for i in range(len(Ns)):
+        print(f"N: {Ns[i]}, time: {times[i]}")
