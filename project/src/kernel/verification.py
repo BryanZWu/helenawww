@@ -84,7 +84,7 @@ def triangle_attention_custom_kernel(q, k, v, attention_mask, from_starting_node
 
 if __name__ == "__main__":
     key = jax.random.PRNGKey(0)
-    Ns = [2 ** i for i in range(5, 10)]
+    Ns = [64, 128, 256, 512] # seq length
     D = 256
     times = []
     for N in Ns:
