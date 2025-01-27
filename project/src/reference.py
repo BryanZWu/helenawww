@@ -55,6 +55,7 @@ def triangle_attn_solution(q, k, v):
     # B, N_f, N_t, N_t: each N_f, N_t dim attends
     # to each of N_t nodes that also start at N_f
     attn_logits = jnp.matmul(q, k)
+    attn_logits = attn_logits / math.sqrt(D)
     attn_score = jax.nn.softmax(attn_logits, axis=-1)
     attn_out = jnp.matmul(attn_score, v) # B, N_f, N_t, D
     return attn_out
@@ -94,6 +95,7 @@ def triangle_attention_with_mha_solution(q, k, v, from_starting_node=True):
 
     # B * H, N_f, N_t, N_t if from_starting_node else B * H, N_t, N_f, N_f
     attn_logits = jnp.matmul(q, k)
+    attn_logits = attn_logits / math.sqrt(head_dim)
     attn_score = jax.nn.softmax(attn_logits, axis=-1)
 
     # B * H, N_f, N_t, head_dim if from_starting_node else B * H, N_t, N_f, head_dim
