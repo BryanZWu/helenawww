@@ -11,7 +11,8 @@ from jax._src.lib.mlir.dialects import mhlo
 # Register the custom call target
 xla_client.register_custom_call_target(
     "triangle_attention_cuda",
-    # TODO: Load the actual shared library
+    # Load the shared library
+    xla_client.get_triangle_attention_cuda_library("cuda/libtriangle_attention.so")
 )
 
 # Define the primitive
