@@ -8,17 +8,22 @@ import numpy as np
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import mhlo
 
-# Register the custom call target
-xla_client.register_custom_call_target(
-    "triangle_attention_cuda",
+# tutorial had:
+# for _name, _value in gpu_ops.get_rms_norm_registrations().items():
+
+for _name, _value in ...: 
     # Load the shared library
-    xla_client.get_triangle_attention_cuda_library("cuda/libtriangle_attention.so")
-)
+    xla_client.register_custom_call_target(
+        _name,
+        _value,
+        platform="cuda",
+    )
 
 # Define the primitive
 triangle_attention_p = core.Primitive("triangle_attention")
 triangle_attention_p.multiple_results = False  # Single output tensor
 
+# Function provided to the user
 def triangle_attention(q, k, v, mask, *, from_starting_node=True):
     """Triangle attention primitive.
     
