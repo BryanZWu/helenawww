@@ -52,7 +52,7 @@ namespace
         // Compute attention logits
         float attn_logit = 0.0f;
         for (int i = 0; i < head_dim; i++) {
-            attn_logit += shared_q[i] * shared_k[i];
+            attn_logit += shared_q[i] * shared_k[i]; // this can prob be further parallzied
         }
         attn_logit /= sqrtf((float)head_dim);
 
@@ -63,8 +63,8 @@ namespace
         shared_logits[seq_idx] = attn_logit;
         block.sync();
 
-        // Softmax computation
-        float max_logit = -1e9;
+        // Softmax computation this can prb be further parallizedsince everything is a for loop and seq length sounds big
+        float max_logit = -1e9; // ensure numerical stability, not too big
         for (int i = 0; i < seq_length; i++) {
             max_logit = fmaxf(max_logit, shared_logits[i]);
         }
