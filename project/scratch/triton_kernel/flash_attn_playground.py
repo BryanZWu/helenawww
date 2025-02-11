@@ -249,24 +249,37 @@ def keep(conf):
 @triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
-              stride_qz, stride_qh, stride_qm, stride_qk,  #
-              stride_kz, stride_kh, stride_kn, stride_kk,  #
-              stride_vz, stride_vh, stride_vk, stride_vn,  #
-              stride_oz, stride_oh, stride_om, stride_on,  #
-              Z, H, N_CTX,  #
-              HEAD_DIM: tl.constexpr,  #
-              BLOCK_M: tl.constexpr,  #
-              BLOCK_N: tl.constexpr,  #
-              STAGE: tl.constexpr  #
+              stride_qz, stride_qh, stride_qm, stride_qk,  # Strides for Q tensor: batch, head, seq_len, head_dim
+              stride_kz, stride_kh, stride_kn, stride_kk,  # Strides for K tensor
+              stride_vz, stride_vh, stride_vk, stride_vn,  # Strides for V tensor
+              stride_oz, stride_oh, stride_om, stride_on,  # Strides for Output tensor
+              Z, H, N_CTX,  # Z=batch_size, H=num_heads, N_CTX=sequence_length
+              HEAD_DIM: tl.constexpr,  # Size of each attention head
+              BLOCK_M: tl.constexpr,  # Block size for sequence dimension
+              BLOCK_N: tl.constexpr,  # Block size for attention computation
+              STAGE: tl.constexpr  # Determines attention pattern (1=non-causal, 3=causal)
               ):
+    # Ensure block size doesn't exceed head dimension
     tl.static_assert(BLOCK_N <= HEAD_DIM)
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    
+    # Grid dimension explanation:
+    # - program_id(0): Indexes along sequence length (N_CTX/BLOCK_M blocks)
+    # - program_id(1): Indexes along batch*heads dimension (Z*H blocks)
+    start_m = tl.program_id(0)  # Block index in sequence dimension
+    off_hz = tl.program_id(1)   # Combined batch and head index
+    
+    # Convert combined batch-head index into separate indices
+    off_z = off_hz // H         # Batch index
+    off_h = off_hz % H          # Head index
+    
+    # Calculate base offset for current batch and head
     qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
 
-    # block pointers
+    # Create block pointers for efficient memory access:
+    # Q: Current block of queries [BLOCK_M, HEAD_DIM]
+    # K: Current block of keys [HEAD_DIM, BLOCK_N]
+    # V: Current block of values [BLOCK_N, HEAD_DIM]
+    # O: Output block [BLOCK_M, HEAD_DIM]
     Q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset,
         shape=(N_CTX, HEAD_DIM),
@@ -300,37 +313,44 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0),
     )
-    # initialize offsets
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    # load scales
-    qk_scale = sm_scale
-    qk_scale *= 1.44269504  # 1/log(2)
-    # load q: it will stay in SRAM throughout
+    # Initialize per-block data structures:
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)  # Sequence offsets within block
+    offs_n = tl.arange(0, BLOCK_N)                      # Attention offsets within block
+    
+    # Initialize tracking variables for softmax computation
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max values for stability
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0          # Sum for normalization
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)      # Accumulated attention outputs
+
+    # Scale factor for attention scores (includes log2 conversion for numerical stability)
+    qk_scale = sm_scale * 1.44269504  # 1.44269504 = 1/log(2)
+
+    # Load query block - remains in SRAM throughout computation
     q = tl.load(Q_block_ptr)
-    # stage 1: off-band
-    # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
-    # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
+
+    # Process attention in two stages:
+    # Stage 1 (STAGE & 1): Process "off-band" attention
+    # - For causal attention: handles all positions before the current block
+    # - For non-causal attention: handles all positions
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
                                         start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
                                         )
-    # stage 2: on-band
+    # Stage 2 (STAGE & 2): Process "on-band" attention
+    # - For causal attention: handles current block with masking
+    # - For non-causal attention: skipped
     if STAGE & 2:
-        # barrier makes it easier for compielr to schedule the
-        # two loops independently
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
                                         start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
                                         )
-    # epilogue
+    # Final processing:
+    # 1. Apply softmax normalization
+    # 2. Store softmax scaling factors (m_i) for backward pass
+    # 3. Store final output values
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
