@@ -1,4 +1,3 @@
-
 '''
 Code adapted from the triton flash-attn-2.0 tutorial:
 https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html
@@ -6,18 +5,12 @@ https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html
 
 import pytest
 import torch
-import triton.tools.experimental_descriptor
+# import triton.tools.experimental_descriptor
 
 import triton
 import triton.language as tl
 
-# Environment variable explanation for Blackwell architecture
-# ENABLE_LHS_TO_TMEM is an experimental environment variable for Blackwell.
-# If set to 1, it can improve performance of Blackwell attention, but may cause
-# correctness issues outside of the _attn_fwd_tma kernel
-
-# Get the active torch device (GPU)
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 # Helper function to check if we're using HIP (AMD) backend
 def is_hip():
@@ -27,82 +20,7 @@ def is_hip():
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
-# Helper function to check if TMA (Tensor Memory Access) is supported
-# Requires CUDA and GPU capability >= 9
-def supports_tma():
-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
-
-# Check if TMA descriptor type is available in Triton language
-HAS_TMA_DESC = "nv_tma_desc_type" in dir(tl)
-
-# Print information about TMA benchmark configuration
-if HAS_TMA_DESC:
-    print("TMA benchmarks will be running with experimental grid constant TMA descriptor.")
-else:
-    print("TMA benchmarks will be running without grid constant TMA descriptor.")
-
-# Helper class for TMA (Tensor Memory Access) auto-tuning
-class TmaAutoTuneHelper:
-    # Inner class to wrap kernel parameters for TMA descriptors
-    class KernelParamWrapper:
-        def __init__(self, desc):
-            self.desc = desc
-
-        def tma_desc_cpu_ptr(self):
-            return self.desc.data_ptr()
-
-    # Constants
-    TMA_SIZE = 128  # Size of TMA descriptor
-
-    def __init__(self):
-        # Initialize TMA descriptor utility functions
-        self.fill_1d_tma_descriptor_inner = (triton.runtime.driver.active.utils.fill_1d_tma_descriptor)
-        self.fill_2d_tma_descriptor_inner = (triton.runtime.driver.active.utils.fill_2d_tma_descriptor)
-        # Initialize descriptor storage based on TMA availability
-        if HAS_TMA_DESC:
-            self.descriptors = {}
-        else:
-            self.cuda_descriptors = {}
-
-    # Initialize TMA descriptor with given name
-    def init_tma_descriptor(self, name):
-        if HAS_TMA_DESC:
-            self.descriptors[name] = torch.empty(TmaAutoTuneHelper.TMA_SIZE, device="cpu", dtype=torch.int8)
-        else:
-            self.cuda_descriptors[name] = torch.empty(TmaAutoTuneHelper.TMA_SIZE, device="cuda", dtype=torch.int8)
-
-    # Fill 1D TMA descriptor with given parameters
-    def fill_1d_tma_descriptor(self, name, ptr, dim, block_dim, element_size):
-        if HAS_TMA_DESC:
-            desc_x = self.descriptors[name]
-            assert desc_x.data_ptr() % 64 == 0  # Ensure 64-byte alignment
-            self.fill_1d_tma_descriptor_inner(ptr, dim, block_dim, element_size, desc_x.data_ptr())
-        else:
-            desc_x = self.cuda_descriptors[name]
-            buf_x = torch.empty_like(desc_x, device="cpu", pin_memory=True)
-            self.fill_1d_tma_descriptor_inner(ptr, dim, block_dim, element_size, buf_x.data_ptr())
-            desc_x.copy_(buf_x, non_blocking=True)
-
-    # Fill 2D TMA descriptor with given parameters
-    def fill_2d_tma_descriptor(self, name, ptr, dim1, dim0, block_dim1, block_dim0, element_size):
-        if HAS_TMA_DESC:
-            desc_x = self.descriptors[name]
-            assert desc_x.data_ptr() % 64 == 0  # Ensure 64-byte alignment
-            self.fill_2d_tma_descriptor_inner(ptr, dim1, dim0, block_dim1, block_dim0, element_size, desc_x.data_ptr())
-        else:
-            desc_x = self.cuda_descriptors[name]
-            buf_x = torch.empty_like(desc_x, device="cpu", pin_memory=True)
-            self.fill_2d_tma_descriptor_inner(ptr, dim1, dim0, block_dim1, block_dim0, element_size, buf_x.data_ptr())
-            desc_x.copy_(buf_x, non_blocking=True)
-
-    # Get TMA descriptor kernel parameter
-    def get_tma_descriptor_kernel_param(self, name):
-        if HAS_TMA_DESC:
-            assert self.descriptors[name] is not None
-            return self.KernelParamWrapper(self.descriptors[name])
-        else:
-            assert self.cuda_descriptors[name] is not None
-            return self.cuda_descriptors[name]
+print("TMA benchmarks will be running without grid constant TMA descriptor.")
 
 
 @triton.jit
@@ -178,58 +96,58 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     return acc, l_i, m_i
 
 
-@triton.jit
-def _attn_fwd_inner_tma(acc, l_i, m_i, q,  #
-                        desc_k, desc_v,  #
-                        offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
-                        BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
-                        STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-                        N_CTX: tl.constexpr):
-    """
-    TMA (Tensor Memory Access) version of the attention forward pass kernel
-    Uses TMA descriptors for more efficient memory access patterns
-    Similar to _attn_fwd_inner but optimized for TMA operations
-    """
-    # range of values handled by this stage
-    if STAGE == 1:
-        lo, hi = 0, start_m * BLOCK_M
-    elif STAGE == 2:
-        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
-        lo = tl.multiple_of(lo, BLOCK_M)
-    # causal = False
-    else:
-        lo, hi = 0, N_CTX
-    offsetkv_y = offset_y + lo
-    # loop over k, v and update accumulator
-    for start_n in range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        # -- compute qk ----
-        k = tl._experimental_descriptor_load(desc_k, [offsetkv_y, 0], [BLOCK_N, HEAD_DIM], dtype).T
-        qk = tl.dot(q, k)
-        if STAGE == 2:
-            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
-        else:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, None]
-        p = tl.math.exp2(qk)
-        l_ij = tl.sum(p, 1)
-        # -- update m_i and l_i
-        alpha = tl.math.exp2(m_i - m_ij)
-        l_i = l_i * alpha + l_ij
-        # -- update output accumulator --
-        acc = acc * alpha[:, None]
-        # update acc
-        v = tl._experimental_descriptor_load(desc_v, [offsetkv_y, 0], [BLOCK_N, HEAD_DIM], dtype)
-        p = p.to(dtype)
-        # note that this non transposed v for FP8 is only supported on Blackwell
-        acc = tl.dot(p, v, acc)
-        # update m_i and l_i
-        m_i = m_ij
-        offsetkv_y += BLOCK_N
-    return acc, l_i, m_i
+# @triton.jit
+# def _attn_fwd_inner_tma(acc, l_i, m_i, q,  #
+#                         desc_k, desc_v,  #
+#                         offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
+#                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
+#                         STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
+#                         N_CTX: tl.constexpr):
+#     """
+#     TMA (Tensor Memory Access) version of the attention forward pass kernel
+#     Uses TMA descriptors for more efficient memory access patterns
+#     Similar to _attn_fwd_inner but optimized for TMA operations
+#     """
+#     # range of values handled by this stage
+#     if STAGE == 1:
+#         lo, hi = 0, start_m * BLOCK_M
+#     elif STAGE == 2:
+#         lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+#         lo = tl.multiple_of(lo, BLOCK_M)
+#     # causal = False
+#     else:
+#         lo, hi = 0, N_CTX
+#     offsetkv_y = offset_y + lo
+#     # loop over k, v and update accumulator
+#     for start_n in range(lo, hi, BLOCK_N):
+#         start_n = tl.multiple_of(start_n, BLOCK_N)
+#         # -- compute qk ----
+#         k = tl._experimental_descriptor_load(desc_k, [offsetkv_y, 0], [BLOCK_N, HEAD_DIM], dtype).T
+#         qk = tl.dot(q, k)
+#         if STAGE == 2:
+#             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+#             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+#             m_ij = tl.maximum(m_i, tl.max(qk, 1))
+#             qk -= m_ij[:, None]
+#         else:
+#             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+#             qk = qk * qk_scale - m_ij[:, None]
+#         p = tl.math.exp2(qk)
+#         l_ij = tl.sum(p, 1)
+#         # -- update m_i and l_i
+#         alpha = tl.math.exp2(m_i - m_ij)
+#         l_i = l_i * alpha + l_ij
+#         # -- update output accumulator --
+#         acc = acc * alpha[:, None]
+#         # update acc
+#         v = tl._experimental_descriptor_load(desc_v, [offsetkv_y, 0], [BLOCK_N, HEAD_DIM], dtype)
+#         p = p.to(dtype)
+#         # note that this non transposed v for FP8 is only supported on Blackwell
+#         acc = tl.dot(p, v, acc)
+#         # update m_i and l_i
+#         m_i = m_ij
+#         offsetkv_y += BLOCK_N
+#     return acc, l_i, m_i
 
 
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
@@ -382,65 +300,6 @@ def keep_tma(conf):
     if (torch.cuda.get_device_capability()[0] == 9 and BLOCK_M * BLOCK_N < 128 * 128 and conf.num_warps == 8):
         return False
     return True
-
-
-@triton.autotune(configs=list(filter(keep_tma, configs_tma)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT"])
-@triton.jit
-def _attn_fwd_tma(sm_scale, M,  #
-                  Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-                  HEAD_DIM: tl.constexpr,  #
-                  BLOCK_M: tl.constexpr,  #
-                  BLOCK_N: tl.constexpr,  #
-                  FP8_OUTPUT: tl.constexpr,  #
-                  STAGE: tl.constexpr  #
-                  ):
-    dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
-
-    offset_y = off_z + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
-    # initialize offsets
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    # load scales
-    qk_scale = sm_scale
-    qk_scale *= 1.44269504  # 1/log(2)
-    # load q: it will stay in SRAM throughout
-    q = tl._experimental_descriptor_load(desc_q, [qo_offset_y, 0], [BLOCK_M, HEAD_DIM], dtype)
-    # stage 1: off-band
-    # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
-    # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
-    if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner_tma(acc, l_i, m_i, q,  #
-                                            desc_k, desc_v,  #
-                                            offset_y, dtype, start_m, qk_scale,  #
-                                            BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                            4 - STAGE, offs_m, offs_n, N_CTX,  #
-                                            )
-    # stage 2: on-band
-    if STAGE & 2:
-        # barrier makes it easier for compielr to schedule the
-        # two loops independently
-        acc, l_i, m_i = _attn_fwd_inner_tma(acc, l_i, m_i, q,  #
-                                            desc_k, desc_v,  #
-                                            offset_y, dtype, start_m, qk_scale,  #
-                                            BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                            2, offs_m, offs_n, N_CTX,  #
-                                            )
-    # epilogue
-    m_i += tl.math.log2(l_i)
-    acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
-    tl.store(m_ptrs, m_i)
-    tl._experimental_descriptor_store(desc_o, acc.to(dtype), [qo_offset_y, 0])
 
 
 @triton.jit
@@ -746,7 +605,7 @@ class _attention(torch.autograd.Function):
     """
     
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, USE_TMA=True):
+    def forward(ctx, q, k, v, causal, sm_scale):
         """
         Forward pass of flash attention
         Args:
@@ -755,7 +614,6 @@ class _attention(torch.autograd.Function):
             v: Value tensor
             causal: Whether to use causal attention
             sm_scale: Softmax scaling factor
-            USE_TMA: Whether to use Tensor Memory Access optimization
         """
         # Verify shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
@@ -779,74 +637,25 @@ class _attention(torch.autograd.Function):
 
         # Initialize scaling factor storage
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        
-        # Choose between TMA and regular implementation
-        if USE_TMA and supports_tma() and not (torch.cuda.get_device_capability()[0] == 9
-                                               and q.dtype == torch.float8_e5m2):
-            # TMA implementation path
-            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
-            
-            # Initialize TMA descriptors
-            desc_helper = TmaAutoTuneHelper()
-            desc_helper.init_tma_descriptor("q")
-            desc_helper.init_tma_descriptor("v")
-            desc_helper.init_tma_descriptor("k")
-            desc_helper.init_tma_descriptor("o")
-            
-            # Grid function for TMA kernel
-            def grid(META):
-                nonlocal desc_helper
-                
-                # Fill TMA descriptors for all tensors
-                desc_helper.fill_2d_tma_descriptor("q", q.data_ptr(), y_dim, HEAD_DIM_K, META["BLOCK_M"], HEAD_DIM_K,
-                                                   q.element_size())
-                desc_helper.fill_2d_tma_descriptor("v", v.data_ptr(), y_dim, HEAD_DIM_K, META["BLOCK_N"], HEAD_DIM_K,
-                                                   v.element_size())
-                desc_helper.fill_2d_tma_descriptor("k", k.data_ptr(), y_dim, HEAD_DIM_K, META["BLOCK_N"], HEAD_DIM_K,
-                                                   k.element_size())
-                desc_helper.fill_2d_tma_descriptor("o", o.data_ptr(), y_dim, HEAD_DIM_K, META["BLOCK_M"], HEAD_DIM_K,
-                                                   o.element_size())
-                
-                return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
-            # Get TMA descriptors
-            desc_q = desc_helper.get_tma_descriptor_kernel_param("q")
-            desc_v = desc_helper.get_tma_descriptor_kernel_param("v")
-            desc_k = desc_helper.get_tma_descriptor_kernel_param("k")
-            desc_o = desc_helper.get_tma_descriptor_kernel_param("o")
-            
-            # Store grid function for backward pass
-            ctx.grid = grid
-            
-            # Launch TMA kernel
-            _attn_fwd_tma[grid](
-                sm_scale, M,
-                q.shape[0], q.shape[1],
-                desc_q, desc_k, desc_v, desc_o,
-                N_CTX=q.shape[2],
-                HEAD_DIM=HEAD_DIM_K,
-                FP8_OUTPUT=q.dtype == torch.float8_e5m2,
-                STAGE=stage,
-                **extra_kern_args)
-        else:
-            # Regular implementation path
-            def grid(args):
-                return (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
-            
-            ctx.grid = grid
-            
-            # Launch regular kernel
-            _attn_fwd[grid](
-                q, k, v, sm_scale, M, o,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                q.shape[0], q.shape[1],
-                N_CTX=q.shape[2],
-                HEAD_DIM=HEAD_DIM_K,
-                STAGE=stage,
-                **extra_kern_args)
+        # Regular implementation path
+        def grid(args):
+            return (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+        
+        ctx.grid = grid
+        
+        # Launch regular kernel
+        _attn_fwd[grid](
+            q, k, v, sm_scale, M, o,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            q.shape[0], q.shape[1],
+            N_CTX=q.shape[2],
+            HEAD_DIM=HEAD_DIM_K,
+            STAGE=stage,
+            **extra_kern_args)
 
         # Save tensors needed for backward pass
         ctx.save_for_backward(q, k, v, o, M)
@@ -1050,6 +859,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
         ms = triton.testing.do_bench(fn)
         
     if provider == "flash":
+        raise NotImplementedError("Official Flash Attention is not implemented for now")
         # Benchmark Flash Attention implementation
         qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         fn = lambda: flash_attn_func(qkv, causal=causal)
@@ -1062,7 +872,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
             
         ms = triton.testing.do_bench(fn)
 
-    # Calculate FLOPS
+    # Calculate FLOPS: TODO: This is still the 1d attention version--need to update for tt
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
     total_flops = 2 * flops_per_matmul
     if causal:
@@ -1077,4 +887,3 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
 if __name__ == "__main__":
     # Run benchmarks (only works on post-Ampere GPUs)
     bench_flash_attention.run(save_path=".", print_data=True)
-
