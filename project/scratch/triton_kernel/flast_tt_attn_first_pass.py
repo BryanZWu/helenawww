@@ -1,3 +1,9 @@
+
+'''
+Code adapted from the triton flash-attn-2.0 tutorial:
+https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html
+'''
+
 import pytest
 import torch
 import triton.tools.experimental_descriptor
@@ -1055,7 +1061,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
             fn = lambda: o.backward(do, retain_graph=True)
             
         ms = triton.testing.do_bench(fn)
-    
+
     # Calculate FLOPS
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
     total_flops = 2 * flops_per_matmul
