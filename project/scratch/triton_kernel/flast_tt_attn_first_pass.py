@@ -34,6 +34,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     Inner kernel for attention forward pass computation
     Computes attention scores and updates accumulator for a block of the attention matrix
     """
+    raise NotImplementedError("Haven't adapted inner attention layer for triangle attention")
     # Determine range of values for current processing stage
     if STAGE == 1:
         # Pre-mask stage: process elements before the mask
@@ -183,6 +184,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
               BLOCK_N: tl.constexpr,  # Block size for attention computation
               STAGE: tl.constexpr  # Determines attention pattern (1=non-causal, 3=causal)
               ):
+    raise NotImplementedError("Haven't adapted fwd attention for triangle attention")
     # Ensure block size doesn't exceed head dimension
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     
@@ -312,6 +314,7 @@ def _attn_bwd_preprocess(O, DO,  #
     Preprocesses data for attention backward pass
     Computes initial delta values needed for gradient computation
     """
+    raise NotImplementedError("Haven't adapted bwd attention for triangle attention")
     # Calculate offsets for the current block
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
@@ -344,6 +347,7 @@ def _attn_bwd_dkdv(dk, dv,  #
     Computes gradients with respect to keys (dk) and values (dv)
     Main computation kernel for the backward pass
     """
+    raise NotImplementedError("Haven't adapted bwd attention for triangle attention")
     # Initialize offsets for the current block
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
@@ -417,6 +421,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
     Computes gradients with respect to queries (dq)
     Part of the backward pass that handles query gradient computation
     """
+    raise NotImplementedError("Haven't adapted bwd attention for triangle attention")
     # Initialize offsets for the current block
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
@@ -482,6 +487,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               BLOCK_N2: tl.constexpr,  #
               BLK_SLICE_FACTOR: tl.constexpr,  #
               HEAD_DIM: tl.constexpr):
+    raise NotImplementedError("Haven't adapted bwd attention for triangle attention")
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
     bhid = tl.program_id(2)
@@ -739,7 +745,7 @@ attention = _attention.apply
 
 @pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 1024, 64)])
 @pytest.mark.parametrize("causal", [True])
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16):
+def test_op(Z, H, N_CTX, HEAD_DIM, causal=False, dtype=torch.float16):
     """
     Test function for attention implementation
     Compares Triton implementation with PyTorch reference implementation
@@ -748,9 +754,9 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16):
     torch.manual_seed(20)
     
     # Initialize input tensors
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    q = (torch.empty((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    k = (torch.empty((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    v = (torch.empty((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     sm_scale = 0.5
     dout = torch.randn_like(q)
     
@@ -775,7 +781,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16):
     tri_dk, k.grad = k.grad.clone(), None
     tri_dq, q.grad = q.grad.clone(), None
     
-    # Compare results
+    # Compare results--forward pass
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
     rtol = 0.0
     # Handle special case for AMD MI200 GPU
@@ -799,33 +805,31 @@ BATCH, N_HEADS, HEAD_DIM = 4, 32, 64
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
-    for causal in [True, False]:
-        if mode == "bwd" and not causal:
-            continue
-        configs.append(
-            triton.testing.Benchmark(
-                x_names=["N_CTX"],
-                x_vals=[2**i for i in range(10, 15)],
-                line_arg="provider",
-                line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
-                (["flash"] if HAS_FLASH else []),
-                line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
-                (["Flash-2"] if HAS_FLASH else []),
-                styles=[("red", "-"), ("blue", "-"), ("green", "-")],
-                ylabel="TFLOPS",
-                plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}",
-                args={
-                    "H": N_HEADS,
-                    "BATCH": BATCH,
-                    "HEAD_DIM": HEAD_DIM,
-                    "mode": mode,
-                    "causal": causal,
-                },
-            ))
+    if mode == "bwd":
+        continue
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=["N_CTX"],
+            x_vals=[2**i for i in range(6, 10)],
+            line_arg="provider",
+            line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
+            (["flash"] if HAS_FLASH else []),
+            line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
+            (["Flash-2"] if HAS_FLASH else []),
+            styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+            ylabel="TFLOPS",
+            plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}",
+            args={
+                "H": N_HEADS,
+                "BATCH": BATCH,
+                "HEAD_DIM": HEAD_DIM,
+                "mode": mode,
+            },
+        ))
 
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, device=DEVICE):
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE):
     """
     Benchmark different attention implementations
     Compares performance of Triton and Flash Attention implementations
@@ -835,20 +839,21 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
     
     if "triton" in provider:
         # Benchmark Triton implementation
-        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        q = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         
         # Handle FP8 case
         if mode == "fwd" and "fp8" in provider:
             q = q.to(torch.float8_e5m2)
             k = k.to(torch.float8_e5m2)
+            # v shoudl be contiguous as B, H, D, N instead of B, H, N, D
             v = v.permute(0, 1, 3, 2).contiguous()
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
             
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale)
+        fn = lambda: attention(q, k, v, sm_scale)
         
         # Setup backward pass if needed
         if mode == "bwd":
@@ -875,8 +880,8 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
     # Calculate FLOPS: TODO: This is still the 1d attention version--need to update for tt
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
     total_flops = 2 * flops_per_matmul
-    if causal:
-        total_flops *= 0.5  # Only half the computations needed for causal attention
+    # if causal:
+    #     total_flops *= 0.5  # Only half the computations needed for causal attention
     if mode == "bwd":
         total_flops *= 2.5  # Additional computations for backward pass
         
