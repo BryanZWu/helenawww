@@ -174,32 +174,60 @@ def keep(conf):
 @triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax, M: max values, Out: output tensor
-              stride_qz, stride_qh, stride_qm, stride_qk,  # Strides for Q tensor: batch, head, seq_len, head_dim
-              stride_kz, stride_kh, stride_kn, stride_kk,  # Strides for K tensor
-              stride_vz, stride_vh, stride_vk, stride_vn,  # Strides for V tensor
-              stride_oz, stride_oh, stride_om, stride_on,  # Strides for Output tensor
-              Z, H, N_CTX,  # Z=batch_size, H=num_heads, N_CTX=sequence_length
+            #   stride_qb, stride_qh, stride_qm, stride_qk,  # Strides for Q tensor: batch, head, seq_len, head_dim
+            #   stride_kb, stride_kh, stride_kn, stride_kk,  # Strides for K tensor
+            #   stride_vb, stride_vh, stride_vk, stride_vn,  # Strides for V tensor
+            #   stride_ob, stride_oh, stride_om, stride_on,  # Strides for Output tensor
+              stride_qb, stride_qh, stride_qn1, stride_qn2, stride_qd,  # Strides for Q tensor: batch, head, seq_len, seq_len, head_dim
+              stride_kb, stride_kh, stride_kn1, stride_kn2, stride_kd,  # Strides for K tensor
+              stride_vb, stride_vh, stride_vn1, stride_vn2, stride_vd,  # Strides for V tensor
+              stride_ob, stride_oh, stride_on1, stride_on2, stride_od,  # Strides for Output tensor
+              B, H, N_CTX,  # B=batch_size, H=num_heads, N_CTX=sequence_length
               HEAD_DIM: tl.constexpr,  # Size of each attention head
               BLOCK_M: tl.constexpr,  # Block size for sequence dimension
               BLOCK_N: tl.constexpr,  # Block size for attention computation
               STAGE: tl.constexpr  # Determines attention pattern (1=non-causal, 3=causal)
               ):
-    raise NotImplementedError("Haven't adapted fwd attention for triangle attention")
+    """
+    Attention forward pass kernel: 
+    Q: [B, H, N, N, D]
+    K: [B, H, N, N, D]
+    V: [B, H, N, N, D]
+
+    Naive implementation:
+    attn_logits = Q @ K.transpose(-2, -1) # [B, H, N, N, N]
+    attn_logits = attn_logits / math.sqrt(head_dim)
+    attn_score = softmax(attn_logits, axis=-1) # [B, H, N, N, N]
+    attn_out = attn_score @ V # [B, H, N, N, D]
+
+    To make this IO aware as flash attention does, we tile the attention computation.
+    """
     # Ensure block size doesn't exceed head dimension
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     
     # Grid dimension explanation:
-    # - program_id(0): Indexes along sequence length (N_CTX/BLOCK_M blocks)
-    # - program_id(1): Indexes along batch*heads dimension (Z*H blocks)
-    start_m = tl.program_id(0)  # Block index in sequence dimension
-    off_hz = tl.program_id(1)   # Combined batch and head index
+    # - program_id(0): Indexes along inner sequence length (N_CTX/BLOCK_M blocks)
+    #      the N along which we aggregate q and k
+    # - program_id(1): Indexes along outer sequence length (N_CTX blocks)
+    # - program_id(2): Indexes along batch*heads dimension (Z*H blocks)
+    start_m = tl.program_id(0)  # Inner sequence dimension (where we tile/aggregate)
+    off_n1 = tl.program_id(1) # Outer sequence dimension
+    off_bh = tl.program_id(2)   # Combined batch and head index
     
     # Convert combined batch-head index into separate indices
-    off_z = off_hz // H         # Batch index
-    off_h = off_hz % H          # Head index
+    off_b = off_bh // H         # Batch index
+    off_h = off_bh % H          # Head index
     
-    # Calculate base offset for current batch and head
-    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    # Calculate base offset for current batch and head, and also first dim of N
+    # (which is effectively just another dim to batch along for now)
+    qvk_offset = (
+        off_b.to(tl.int64) * stride_qb +
+        off_h.to(tl.int64) * stride_qh +
+        off_n1.to(tl.int64) * stride_qn1
+    )
+
+    # Flash attention 2 slices Q instead of KV slicing, so that the output
+    # is written by one warp/SM. 
 
     # Create block pointers for efficient memory access:
     # Q: Current block of queries [BLOCK_M, HEAD_DIM]
@@ -209,16 +237,17 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     Q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset,
         shape=(N_CTX, HEAD_DIM),
-        strides=(stride_qm, stride_qk),
+        strides=(stride_qn2, stride_qd),
         offsets=(start_m * BLOCK_M, 0),
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0),
     )
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
+    # TODO: will need to understand what's going on with these block ptrs
     V_block_ptr = tl.make_block_ptr(
         base=V + qvk_offset,
         shape=(N_CTX, HEAD_DIM),
-        strides=(stride_vk, stride_vn),
+        strides=(stride_vn2, stride_vd),
         offsets=(0, 0),
         block_shape=(BLOCK_N, HEAD_DIM),
         order=v_order,
@@ -226,7 +255,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     K_block_ptr = tl.make_block_ptr(
         base=K + qvk_offset,
         shape=(HEAD_DIM, N_CTX),
-        strides=(stride_kk, stride_kn),
+        strides=(stride_kn2, stride_kd),
         offsets=(0, 0),
         block_shape=(HEAD_DIM, BLOCK_N),
         order=(0, 1),
@@ -234,7 +263,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     O_block_ptr = tl.make_block_ptr(
         base=Out + qvk_offset,
         shape=(N_CTX, HEAD_DIM),
-        strides=(stride_om, stride_on),
+        strides=(stride_on2, stride_od),
         offsets=(start_m * BLOCK_M, 0),
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0),
@@ -242,7 +271,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     # Initialize per-block data structures:
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)  # Sequence offsets within block
     offs_n = tl.arange(0, BLOCK_N)                      # Attention offsets within block
-    
+
     # Initialize tracking variables for softmax computation
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max values for stability
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0          # Sum for normalization
@@ -279,9 +308,10 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     # 3. Store final output values
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
+    m_ptrs = M + off_bh * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+    raise NotImplementedError("In progress")
 
 
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
