@@ -26,9 +26,9 @@ print("TMA benchmarks will be running without grid constant TMA descriptor.")
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     K_block_ptr, V_block_ptr,  #
-                    start_m, qk_scale,  #
+                    start_qn2, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
+                    STAGE: tl.constexpr, offs_qn2: tl.constexpr, offs_kn2: tl.constexpr,  #
                     N_CTX: tl.constexpr, fp8_v: tl.constexpr):
     """
     Inner kernel for attention forward pass computation
@@ -38,10 +38,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     # Determine range of values for current processing stage
     if STAGE == 1:
         # Pre-mask stage: process elements before the mask
-        lo, hi = 0, start_m * BLOCK_M
+        lo, hi = 0, start_qn2 * BLOCK_M
     elif STAGE == 2:
         # Mask stage: process elements within the mask
-        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo, hi = start_qn2 * BLOCK_M, (start_qn2 + 1) * BLOCK_M
         lo = tl.multiple_of(lo, BLOCK_M)  # Ensure alignment
     else:
         # Post-mask stage: process all remaining elements
@@ -61,7 +61,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         
         # Apply causal mask if in mask stage
         if STAGE == 2:
-            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            mask = offs_qn2[:, None] >= (start_n + offs_kn2[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
@@ -201,6 +201,18 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     attn_out = attn_score @ V # [B, H, N, N, D]
 
     To make this IO aware as flash attention does, we tile the attention computation.
+
+    Note on nomenclature:
+    - B: batch dimension
+    - H: head dimension
+    - N1: outer sequence dimension (where we tile/aggregate)
+    - N2: inner sequence dimension (where we compute attention)
+    - D: head dimension
+
+    - M: row dim of attn matrix (N2 for Q)
+    - N: col dim of attn matrix (N2 for K/V)
+
+    (N1/N2 is not the same as N!)
     """
     # Ensure block size doesn't exceed head dimension
     tl.static_assert(BLOCK_N <= HEAD_DIM)
@@ -210,7 +222,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     #      the N along which we aggregate q and k
     # - program_id(1): Indexes along outer sequence length (N_CTX blocks)
     # - program_id(2): Indexes along batch*heads dimension (Z*H blocks)
-    start_m = tl.program_id(0)  # Inner sequence dimension (where we tile/aggregate)
+    start_qn2 = tl.program_id(0)  # Inner sequence dimension (where we tile/aggregate)
     off_n1 = tl.program_id(1) # Outer sequence dimension
     off_bh = tl.program_id(2)   # Combined batch and head index
     
@@ -238,7 +250,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
         base=Q + qvk_offset,
         shape=(N_CTX, HEAD_DIM),
         strides=(stride_qn2, stride_qd),
-        offsets=(start_m * BLOCK_M, 0),
+        offsets=(start_qn2 * BLOCK_M, 0),
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0),
     )
@@ -264,13 +276,15 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
         base=Out + qvk_offset,
         shape=(N_CTX, HEAD_DIM),
         strides=(stride_on2, stride_od),
-        offsets=(start_m * BLOCK_M, 0),
+        offsets=(start_qn2 * BLOCK_M, 0),
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0),
     )
     # Initialize per-block data structures:
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)  # Sequence offsets within block
-    offs_n = tl.arange(0, BLOCK_N)                      # Attention offsets within block
+    # Sequence offsets within the block: N2 dim of Q
+    offs_qn2 = start_qn2 * BLOCK_M + tl.arange(0, BLOCK_M)  
+    # Attention target offsets within the block: N2 dim of KV
+    offs_kn2 = tl.arange(0, BLOCK_N)                     
 
     # Initialize tracking variables for softmax computation
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max values for stability
@@ -289,18 +303,18 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     # - For non-causal attention: handles all positions
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                        start_m, qk_scale,  #
+                                        start_qn2, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        4 - STAGE, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                        4 - STAGE, offs_qn2, offs_kn2, N_CTX, V.dtype.element_ty == tl.float8e5  #
                                         )
     # Stage 2 (STAGE & 2): Process "on-band" attention
     # - For causal attention: handles current block with masking
     # - For non-causal attention: skipped
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                        start_m, qk_scale,  #
+                                        start_qn2, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                        2, offs_qn2, offs_kn2, N_CTX, V.dtype.element_ty == tl.float8e5  #
                                         )
     # Final processing:
     # 1. Apply softmax normalization
@@ -308,7 +322,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     # 3. Store final output values
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    m_ptrs = M + off_bh * N_CTX + offs_m
+    m_ptrs = M + off_bh * N_CTX + offs_qn2
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
     raise NotImplementedError("In progress")
