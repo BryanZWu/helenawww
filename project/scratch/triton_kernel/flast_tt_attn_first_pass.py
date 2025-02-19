@@ -1,6 +1,15 @@
 '''
 Code adapted from the triton flash-attn-2.0 tutorial:
 https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html
+
+Modifications: 
+- In AF2 triangular attention, an additional bias is applied to the 
+  attention scores: "The decision whether edge ij will receive an
+  update from edge ik is not only determined by their
+  query-key similarity (as in standard attention [95]),
+  but also modulated by the information bjk derived from
+  the third edge jk of this triangle"
+- Triangle attention input is pw for all QKV: (B, H, N, N, D)
 '''
 
 import pytest
@@ -25,32 +34,22 @@ print("TMA benchmarks will be running without grid constant TMA descriptor.")
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
-                    K_block_ptr, V_block_ptr,  #
+                    K_block_ptr, V_block_ptr, B_block_ptr, #
                     start_qn2, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
-                    STAGE: tl.constexpr, offs_qn2: tl.constexpr, offs_kn2: tl.constexpr,  #
+                    offs_qn2: tl.constexpr, offs_kn2: tl.constexpr,  #
                     N_CTX: tl.constexpr, fp8_v: tl.constexpr):
     """
     Inner kernel for attention forward pass computation
     Computes attention scores and updates accumulator for a block of the attention matrix
     """
-    raise NotImplementedError("Haven't adapted inner attention layer for triangle attention")
-    # Determine range of values for current processing stage
-    if STAGE == 1:
-        # Pre-mask stage: process elements before the mask
-        lo, hi = 0, start_qn2 * BLOCK_M
-    elif STAGE == 2:
-        # Mask stage: process elements within the mask
-        lo, hi = start_qn2 * BLOCK_M, (start_qn2 + 1) * BLOCK_M
-        lo = tl.multiple_of(lo, BLOCK_M)  # Ensure alignment
-    else:
-        # Post-mask stage: process all remaining elements
-        lo, hi = 0, N_CTX
-        
+    lo, hi = 0, N_CTX
+
     # Advance block pointers to correct starting positions
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
-    
+    B_block_ptr = tl.advance(B_block_ptr, (0, lo))
+
     # Process blocks of K and V to compute attention
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -58,27 +57,22 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # Compute attention scores (Q * K^T)
         k = tl.load(K_block_ptr)
         qk = tl.dot(q, k)
+
+        # Apply attention bias 
+        b = tl.load(B_block_ptr)
+        qk = qk * qk_scale + b
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None] # Subtract max value for numerical stability
         
-        # Apply causal mask if in mask stage
-        if STAGE == 2:
-            mask = offs_qn2[:, None] >= (start_n + offs_kn2[None, :])
-            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
-        else:
-            # Regular softmax scaling
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, None]
-            
         # Compute softmax values
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
-        
+
         # Update accumulators
         alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
-        
+
         # Load V and compute attention output
         v = tl.load(V_block_ptr)
         if fp8_v:
@@ -86,14 +80,15 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         else:
             p = p.to(tl.float16)  # Otherwise use FP16
         acc = tl.dot(p, v, acc)  # Update accumulator with attention values
-        
+
         # Update tracking variables
         m_i = m_ij
-        
+
         # Advance block pointers
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        
+        B_block_ptr = tl.advance(B_block_ptr, (0, BLOCK_N))
+
     return acc, l_i, m_i
 
 
@@ -171,51 +166,50 @@ def keep(conf):
     return True
 
 
-@triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
+@triton.autotune(list(filter(keep, configs)), key=["n", "d"])
 @triton.jit
-def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax, M: max values, Out: output tensor
-            #   stride_qb, stride_qh, stride_qm, stride_qk,  # Strides for Q tensor: batch, head, seq_len, head_dim
-            #   stride_kb, stride_kh, stride_kn, stride_kk,  # Strides for K tensor
-            #   stride_vb, stride_vh, stride_vk, stride_vn,  # Strides for V tensor
-            #   stride_ob, stride_oh, stride_om, stride_on,  # Strides for Output tensor
+def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for softmax, M: max values, Out: output tensor
               stride_qb, stride_qh, stride_qn1, stride_qn2, stride_qd,  # Strides for Q tensor: batch, head, seq_len, seq_len, head_dim
               stride_kb, stride_kh, stride_kn1, stride_kn2, stride_kd,  # Strides for K tensor
               stride_vb, stride_vh, stride_vn1, stride_vn2, stride_vd,  # Strides for V tensor
               stride_ob, stride_oh, stride_on1, stride_on2, stride_od,  # Strides for Output tensor
-              B, H, N_CTX,  # B=batch_size, H=num_heads, N_CTX=sequence_length
-              HEAD_DIM: tl.constexpr,  # Size of each attention head
+              stride_bb, stride_bh, stride_bn1, stride_bn2,  # Strides for B tensor
+              b, h, n,  # b=batch_size, h=num_heads, n=sequence_length
+              d: tl.constexpr,  # Size of each attention head
               BLOCK_M: tl.constexpr,  # Block size for sequence dimension
               BLOCK_N: tl.constexpr,  # Block size for attention computation
-              STAGE: tl.constexpr  # Determines attention pattern (1=non-causal, 3=causal)
               ):
     """
     Attention forward pass kernel: 
-    Q: [B, H, N, N, D]
-    K: [B, H, N, N, D]
-    V: [B, H, N, N, D]
+    Q: [b, h, n, n, d]
+    K: [b, h, n, n, d]
+    V: [b, h, n, n, d]
+    B: [b, h, n, n]
+    
 
     Naive implementation:
-    attn_logits = Q @ K.transpose(-2, -1) # [B, H, N, N, N]
-    attn_logits = attn_logits / math.sqrt(head_dim)
-    attn_score = softmax(attn_logits, axis=-1) # [B, H, N, N, N]
-    attn_out = attn_score @ V # [B, H, N, N, D]
+    1. attn_logits = Q @ K.transpose(-2, -1) # [B, H, N, N, N]
+    2. attn_logits = attn_logits / math.sqrt(head_dim)
+    3. attn_logits = attn_logits + bjk # [B, H, N, N, N]
+    4. attn_score = softmax(attn_logits, axis=-1) # [B, H, N, N, N]
+    5. attn_out = attn_score @ V # [B, H, N, N, D]
 
-    To make this IO aware as flash attention does, we tile the attention computation.
+    Of these, step 3 is not handled by out-of-the-box flash attention.
 
     Note on nomenclature:
-    - B: batch dimension
-    - H: head dimension
-    - N1: outer sequence dimension (where we tile/aggregate)
-    - N2: inner sequence dimension (where we compute attention)
-    - D: head dimension
+    - b: batch dimension
+    - h: head dimension
+    - n1: outer sequence dimension (where we tile/aggregate)
+    - n2: inner sequence dimension (where we compute attention)
+    - d: head dimension
 
-    - M: row dim of attn matrix (N2 for Q)
-    - N: col dim of attn matrix (N2 for K/V)
+    - m: row dim of attn matrix (n2 for Q)
+    - n: col dim of attn matrix (n2 for K/V)
 
-    (N1/N2 is not the same as N!)
+    (n1/n2 is not the same as N!)
     """
     # Ensure block size doesn't exceed head dimension
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
+    tl.static_assert(BLOCK_N <= d)
     
     # Grid dimension explanation:
     # - program_id(0): Indexes along inner sequence length (N_CTX/BLOCK_M blocks)
@@ -227,15 +221,21 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     off_bh = tl.program_id(2)   # Combined batch and head index
     
     # Convert combined batch-head index into separate indices
-    off_b = off_bh // H         # Batch index
-    off_h = off_bh % H          # Head index
+    off_b = off_bh // h         # Batch index
+    off_h = off_bh % h          # Head index
     
     # Calculate base offset for current batch and head, and also first dim of N
     # (which is effectively just another dim to batch along for now)
+    # Note that we assume similar strides for Q, K, V, as the original
+    # triton flash attention kernel does.
     qvk_offset = (
         off_b.to(tl.int64) * stride_qb +
         off_h.to(tl.int64) * stride_qh +
         off_n1.to(tl.int64) * stride_qn1
+    )
+    b_offset = (
+        off_b.to(tl.int64) * stride_bb +
+        off_h.to(tl.int64) * stride_bh
     )
 
     # Flash attention 2 slices Q instead of KV slicing, so that the output
@@ -248,36 +248,44 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     # O: Output block [BLOCK_M, HEAD_DIM]
     Q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset,
-        shape=(N_CTX, HEAD_DIM),
+        shape=(n, d),
         strides=(stride_qn2, stride_qd),
-        offsets=(start_qn2 * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
+        offsets=(start_qn2 * BLOCK_M, 0), # Tile Q across blocks
+        block_shape=(BLOCK_M, d),
         order=(1, 0),
     )
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
     # TODO: will need to understand what's going on with these block ptrs
     V_block_ptr = tl.make_block_ptr(
         base=V + qvk_offset,
-        shape=(N_CTX, HEAD_DIM),
+        shape=(n, d),
         strides=(stride_vn2, stride_vd),
         offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
+        block_shape=(BLOCK_N, d),
         order=v_order,
     )
     K_block_ptr = tl.make_block_ptr(
         base=K + qvk_offset,
-        shape=(HEAD_DIM, N_CTX),
+        shape=(d, n),
         strides=(stride_kn2, stride_kd),
         offsets=(0, 0),
-        block_shape=(HEAD_DIM, BLOCK_N),
+        block_shape=(d, BLOCK_N),
         order=(0, 1),
+    )
+    B_block_ptr = tl.make_block_ptr(
+        base=B + b_offset,
+        shape=(n, n),
+        strides=(stride_bn1, stride_bn2),
+        offsets=(start_qn2 * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_N),
+        order=(1, 0),
     )
     O_block_ptr = tl.make_block_ptr(
         base=Out + qvk_offset,
-        shape=(N_CTX, HEAD_DIM),
+        shape=(n, d),
         strides=(stride_on2, stride_od),
         offsets=(start_qn2 * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
+        block_shape=(BLOCK_M, d),
         order=(1, 0),
     )
     # Initialize per-block data structures:
@@ -289,7 +297,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     # Initialize tracking variables for softmax computation
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max values for stability
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0          # Sum for normalization
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)      # Accumulated attention outputs
+    acc = tl.zeros([BLOCK_M, d], dtype=tl.float32)      # Accumulated attention outputs
 
     # Scale factor for attention scores (includes log2 conversion for numerical stability)
     qk_scale = sm_scale * 1.44269504  # 1.44269504 = 1/log(2)
@@ -297,35 +305,24 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  # sm_scale: scaling factor for softmax
     # Load query block - remains in SRAM throughout computation
     q = tl.load(Q_block_ptr)
 
-    # Process attention in two stages:
-    # Stage 1 (STAGE & 1): Process "off-band" attention
-    # - For causal attention: handles all positions before the current block
-    # - For non-causal attention: handles all positions
-    if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                        start_qn2, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        4 - STAGE, offs_qn2, offs_kn2, N_CTX, V.dtype.element_ty == tl.float8e5  #
-                                        )
-    # Stage 2 (STAGE & 2): Process "on-band" attention
-    # - For causal attention: handles current block with masking
-    # - For non-causal attention: skipped
-    if STAGE & 2:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                        start_qn2, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        2, offs_qn2, offs_kn2, N_CTX, V.dtype.element_ty == tl.float8e5  #
-                                        )
+    acc, l_i, m_i = _attn_fwd_inner(
+        acc, l_i, m_i, q,
+        K_block_ptr, V_block_ptr, B_block_ptr, #
+        start_qn2, qk_scale,  #
+        BLOCK_M, d, BLOCK_N,  #
+        offs_qn2, offs_kn2,
+        n, V.dtype.element_ty == tl.float8e5  #
+        )
+
     # Final processing:
     # 1. Apply softmax normalization
     # 2. Store softmax scaling factors (m_i) for backward pass
     # 3. Store final output values
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    m_ptrs = M + off_bh * N_CTX + offs_qn2
+    m_ptrs = M + off_bh * n + offs_qn2
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
-    raise NotImplementedError("In progress")
 
 
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
@@ -655,7 +652,7 @@ class _attention(torch.autograd.Function):
     """
     
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale):
+    def forward(ctx, q, k, v, b, sm_scale):
         """
         Forward pass of flash attention
         Args:
@@ -674,8 +671,6 @@ class _attention(torch.autograd.Function):
         # Initialize output tensor
         o = torch.empty_like(q)
         
-        # Determine attention stage based on causality
-        stage = 3 if causal else 1
         
         # Setup kernel arguments
         extra_kern_args = {}
@@ -695,23 +690,22 @@ class _attention(torch.autograd.Function):
         ctx.grid = grid
         
         # Launch regular kernel
+        # breakpoint()
         _attn_fwd[grid](
-            q, k, v, sm_scale, M, o,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            q.shape[0], q.shape[1],
-            N_CTX=q.shape[2],
-            HEAD_DIM=HEAD_DIM_K,
-            STAGE=stage,
+            q, k, v, b, sm_scale, M, o,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3), k.stride(4),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3), v.stride(4),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3), o.stride(4),
+            b.stride(0), b.stride(1), b.stride(2), b.stride(3),
+            b=q.shape[0], h=q.shape[1], n=q.shape[2],
+            d=HEAD_DIM_K,
             **extra_kern_args)
 
         # Save tensors needed for backward pass
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
-        ctx.causal = causal
         return o
 
     @staticmethod
@@ -788,8 +782,7 @@ attention = _attention.apply
 
 
 @pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 1024, 64)])
-@pytest.mark.parametrize("causal", [True])
-def test_op(Z, H, N_CTX, HEAD_DIM, causal=False, dtype=torch.float16):
+def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
     """
     Test function for attention implementation
     Compares Triton implementation with PyTorch reference implementation
@@ -805,10 +798,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal=False, dtype=torch.float16):
     dout = torch.randn_like(q)
     
     # Reference implementation using PyTorch
-    M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))  # Causal mask
+    b = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))  # Causal mask
     p = torch.matmul(q, k.transpose(2, 3)) * sm_scale  # Compute attention scores
-    if causal:
-        p[:, :, M == 0] = float("-inf")  # Apply causal mask
     p = torch.softmax(p.float(), dim=-1).half()  # Apply softmax
     ref_out = torch.matmul(p, v)  # Compute attention output
     
@@ -819,7 +810,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal=False, dtype=torch.float16):
     ref_dq, q.grad = q.grad.clone(), None
     
     # Triton implementation
-    tri_out = attention(q, k, v, causal, sm_scale).half()
+    tri_out = attention(q, k, v, b, sm_scale).half()
     tri_out.backward(dout)
     tri_dv, v.grad = v.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
@@ -845,7 +836,8 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 64
+# BATCH, N_HEADS, HEAD_DIM = 4, 32, 64 # To test on A100
+BATCH, N_HEADS, HEAD_DIM = 4, 32, 64 # To test on L4
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
@@ -854,7 +846,7 @@ for mode in ["fwd", "bwd"]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["N_CTX"],
-            x_vals=[2**i for i in range(6, 10)],
+            x_vals=[2**i for i in range(3, 5)], # will want to check this later
             line_arg="provider",
             line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
             (["flash"] if HAS_FLASH else []),
@@ -886,18 +878,19 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
         q = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         k = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         v = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        
+        b = torch.randn((BATCH, H, N_CTX, N_CTX), dtype=dtype, device=device, requires_grad=True)
         # Handle FP8 case
         if mode == "fwd" and "fp8" in provider:
             q = q.to(torch.float8_e5m2)
             k = k.to(torch.float8_e5m2)
             # v shoudl be contiguous as B, H, D, N instead of B, H, N, D
-            v = v.permute(0, 1, 3, 2).contiguous()
-            v = v.permute(0, 1, 3, 2)
+            v = v.permute(0, 1, 2, 4, 3).contiguous()
+            v = v.permute(0, 1, 2, 4, 3)
             v = v.to(torch.float8_e5m2)
+            b = b.to(torch.float8_e5m2)
             
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, sm_scale)
+        fn = lambda: attention(q, k, v, b, sm_scale)
         
         # Setup backward pass if needed
         if mode == "bwd":
