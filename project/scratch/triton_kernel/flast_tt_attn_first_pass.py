@@ -975,7 +975,7 @@ def reference_tt_attn(q, k, v, b, sm_scale):
     qk_scaled_bias = qk_scaled + b.view(Z, H, 1, N_CTX, N_CTX)
 
     # Step 3: Softmax
-    p = torch.softmax(qk_scaled_bias.float(), dim=-1).half()
+    p = torch.softmax(qk_scaled_bias.float(), dim=-1)
 
     # Step 4: Output
     ref_out = torch.matmul(p, v)
@@ -988,25 +988,111 @@ def reference_tt_attn(q, k, v, b, sm_scale):
     }
 
 @torch.no_grad()
-def reference_tt_tiled(q, k, v, b, sm_scale, dout, BLOCK_N):
+def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64):
     """
-    CPU-computed, but in the same style as flash attention--tiling,
-    keeping track of the current max value of QK, etc
+    CPU-computed reference implementation that follows the same tiling strategy as flash attention.
+    This matches the Triton kernel's block-based computation pattern for easier debugging.
+    
+    Args:
+        q: Query tensor [B, H, N, N, D]
+        k: Key tensor [B, H, N, N, D]
+        v: Value tensor [B, H, N, N, D]
+        b: Bias tensor [B, H, N, N]
+        sm_scale: Scale factor for attention scores
+        BLOCK_N: Block size for tiling (default: 64)
     """
-    Z, H, N_CTX = q.shape[:3]
-    for pid2 in range(Z * H):
-        z, h = divmod(pid2, H)
-        for pid1 in range(N_CTX):
-            n1 = pid1
-            for pid2 in range(N_CTX):
-                n2 = pid2
-                q_slice = q[z, h, n1, n2, :]
-                k_slice = k[z, h, n1, n2, :]
-                v_slice = v[z, h, n1, n2, :]
+    Z, H, N_CTX, _, D = q.shape
+    out = torch.zeros_like(q)
+    
+    # Initialize tracking tensors for each query position
+    m_i = torch.full((Z, H, N_CTX, N_CTX), float('-inf'), device=q.device)  # Max scores
+    l_i = torch.ones((Z, H, N_CTX, N_CTX), device=q.device)  # Sum for normalization
 
-def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16):
+    out_dict = {
+        "out": out,
+        "m_i": m_i,
+        "l_i": l_i,
+    }
+    
+    # Process each batch and head
+    for z in range(Z):
+        for h in range(H):
+            # Process each outer sequence position
+            for n1 in range(N_CTX):
+                save_debugging = (z == 1) and (h == 2) and (n1 == 4)
+                if save_debugging:
+                    to_save = {
+                        "q_block": [],
+                        "k_block": [],
+                        "v_block": [],
+                        "b_block": [],
+                        "qk": [],
+                        "qk_scaled": [],
+                        "qk_scaled_bias": [],
+                        "qk_scaled_bias_minus_max": [],
+                        "p": [],
+                    }
+                # Process blocks of inner sequence
+                for start_n in range(0, N_CTX, BLOCK_N):
+
+                    end_n = min(start_n + BLOCK_N, N_CTX)
+                    block_size = end_n - start_n
+                    
+                    # Get current block of query, key, value
+                    q_block = q[z, h, n1, :, :]  # [N_CTX, D]
+                    k_block = k[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
+                    v_block = v[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
+                    b_block = b[z, h, n1, start_n:end_n]  # [BLOCK_N]
+                    
+                    # Compute attention scores for this block
+                    qk = torch.matmul(q_block, k_block.transpose(-2, -1))  # [N_CTX, BLOCK_N]
+                    qk_scaled = qk * sm_scale 
+                    qk_scaled_bias = qk_scaled + b_block
+                    
+                    if save_debugging:
+                        to_save["q_block"].append(q_block)
+                        to_save["k_block"].append(k_block)
+                        to_save["v_block"].append(v_block)
+                        to_save["b_block"].append(b_block)
+                        to_save["qk"].append(qk)
+                        to_save["qk_scaled"].append(qk_scaled)
+                        to_save["qk_scaled_bias"].append(qk_scaled_bias)
+                    
+                    # Update running max scores
+                    m_ij = torch.max(qk_scaled_bias, dim=-1)[0]  # [N_CTX]
+                    m_i_new = torch.maximum(m_i[z, h, n1, :], m_ij)  # [N_CTX]
+                    
+                    # Compute attention probabilities
+                    qk_scaled_bias_minus_max = qk_scaled_bias - m_i_new.unsqueeze(-1)  # Subtract new max for stability
+                    p = torch.exp2(qk_scaled_bias_minus_max)  # [N_CTX, BLOCK_N]
+                    
+                    if save_debugging:
+                        to_save["qk_scaled_bias_minus_max"].append(qk_scaled_bias_minus_max)
+                        to_save["p"].append(p)
+                        out_dict["debugging_intermediate_values"] = to_save
+
+                    # Update sum for normalization
+                    l_ij = torch.sum(p, dim=-1)  # [N_CTX]
+                    alpha = torch.exp2(m_i[z, h, n1, :] - m_i_new)  # [N_CTX]
+                    l_i[z, h, n1, :] = l_i[z, h, n1, :] * alpha + l_ij
+                    
+                    # Update output accumulator
+                    # Scale current output by alpha for stability
+                    out[z, h, n1, :, :] = out[z, h, n1, :, :] * alpha.unsqueeze(-1)
+                    # Add contribution from current block
+                    out[z, h, n1, :, :] = out[z, h, n1, :, :] + torch.matmul(p, v_block)
+                    
+                    # Update max scores for next iteration
+                    m_i[z, h, n1, :] = m_i_new
+                
+                # Final normalization
+                out[z, h, n1, :, :] = out[z, h, n1, :, :] / l_i[z, h, n1, :].unsqueeze(-1)
+    
+    return out_dict
+
+def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, BLOCK_N=32, dtype=torch.float32):
     """
-    Test function that prints intermediate values for debugging
+    Test function that compares ground truth (full matrix) implementation with CPU-tiled implementation.
 
     Steps for debugging:
     1. We pick a specific set of indices for B, H, N1:
@@ -1022,61 +1108,73 @@ def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=t
             the reference implementation, compute current max value of QK on a per-
             block basis.
         d. TODO
+    
+    
+    Args:
+        Z: Batch size
+        H: Number of heads
+        N_CTX: Sequence length
+        HEAD_DIM: Dimension of each head
+        BLOCK_N: Block size for tiled implementation
+        dtype: Data type for tensors
     """
     torch.manual_seed(20)
     
-    debug_using_linear = False
-    def randlin(shape):
-        total_nel = torch.prod(torch.tensor(shape))
-        return torch.arange(total_nel, device=DEVICE).reshape(shape)
-    if debug_using_linear:
-        q = randlin((Z, H, N_CTX, N_CTX, HEAD_DIM))
-        k = randlin((Z, H, N_CTX, N_CTX, HEAD_DIM))
-        v = randlin((Z, H, N_CTX, N_CTX, HEAD_DIM))
-        b = randlin((Z, H, N_CTX, N_CTX))
-    else:
-        # Initialize input tensors
-        q = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
-        k = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
-        v = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
-        b = torch.ones((Z, H, N_CTX, N_CTX), device=DEVICE)
+    # Initialize input tensors
+    q = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+    k = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+    v = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+    b = torch.ones((Z, H, N_CTX, N_CTX), dtype=dtype, device=DEVICE)
     sm_scale = 0.5
 
-    # Compute reference implementation
-    print("\nComputing reference implementation...")
+    print("\nComputing ground truth implementation...")
     with torch.no_grad():
-        # First thing to check:
-        # Step 1: QK^T. 
-        breakpoint()
-        qk = torch.matmul(q, k.transpose(-2, -1))
-        print(f"QK^T stats - mean: {qk.mean():.4f}, std: {qk.std():.4f}")
+        gt_results = reference_tt_attn(q, k, v, b, sm_scale)
+        gt_out = gt_results["ref_out"]
+        print(f"Ground truth output stats - mean: {gt_out.mean():.4f}, std: {gt_out.std():.4f}")
         
-        # Step 2: Scale and add bias--attn scaling happens before bias addition
-        qk = qk * sm_scale + b.view(Z, H, 1, N_CTX, N_CTX)
-        print(f"After scale+bias - mean: {qk.mean():.4f}, std: {qk.std():.4f}")
-        
-        # Step 3: Softmax
-        p = torch.softmax(qk.float(), dim=-1).half()
-        print(f"After softmax - mean: {p.mean():.4f}, std: {p.std():.4f}")
-        
-        # Step 4: Output
-        ref_out = torch.matmul(p, v)
-        print(f"Output stats - mean: {ref_out.mean():.4f}, std: {ref_out.std():.4f}")
+        # Print intermediate values for debugging
+        print(f"Ground truth QK^T stats - mean: {gt_results['qk'].mean():.4f}, std: {gt_results['qk'].std():.4f}")
+        print(f"Ground truth QK scaled stats - mean: {gt_results['qk_scaled'].mean():.4f}, std: {gt_results['qk_scaled'].std():.4f}")
+        print(f"Ground truth QK scaled+bias stats - mean: {gt_results['qk_scaled_bias'].mean():.4f}, std: {gt_results['qk_scaled_bias'].std():.4f}")
+        print(f"Ground truth softmax stats - mean: {gt_results['p'].mean():.4f}, std: {gt_results['p'].std():.4f}")
     
-    # Compute Triton implementation
-    print("\nComputing Triton implementation...")
-    tri_out = attention(q, k, v, b, sm_scale)
-    print(f"Triton output stats - mean: {tri_out.mean():.4f}, std: {tri_out.std():.4f}")
+    print("\nComputing CPU-tiled implementation...")
+    tiled_out_dict = reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N)
+    tiled_out = tiled_out_dict["out"]
+    print(f"Tiled output stats - mean: {tiled_out.mean():.4f}, std: {tiled_out.std():.4f}")
     
     # Compare results
-    max_diff = (ref_out - tri_out).abs().max().item()
-    print(f"\nMaximum absolute difference: {max_diff:.4f}")
+    max_diff = (gt_out - tiled_out).abs().max().item()
+    mean_diff = (gt_out - tiled_out).abs().mean().item()
+    print(f"\nDifferences between implementations:")
+    print(f"Maximum absolute difference: {max_diff:.4f}")
+    print(f"Mean absolute difference: {mean_diff:.4f}")
     
-    return ref_out, tri_out
+    # Check specific positions
+    # Look at a specific batch, head, and sequence position
+    b_idx, h_idx, n1_idx = 1, 2, 4  # These match the indices mentioned in the debugging steps
+    print(f"\nChecking specific position (b={b_idx}, h={h_idx}, n1={n1_idx}):")
+    gt_slice = gt_out[b_idx, h_idx, n1_idx]
+    tiled_slice = tiled_out[b_idx, h_idx, n1_idx]
+    slice_max_diff = (gt_slice - tiled_slice).abs().max().item()
+    slice_mean_diff = (gt_slice - tiled_slice).abs().mean().item()
+    print(f"Slice maximum absolute difference: {slice_max_diff:.4f}")
+    print(f"Slice mean absolute difference: {slice_mean_diff:.4f}")
+    
+    return {
+        "ground_truth": gt_results,
+        "tiled_output": tiled_out,
+        "max_diff": max_diff,
+        "mean_diff": mean_diff
+    }
+
+
 
 
 if __name__ == "__main__":
     # Run benchmarks (only works on post-Ampere GPUs)
     # bench_flash_attention.run(save_path=".", print_data=True)
     # test_op(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16)
-    ref_out, tri_out = test_attention_intermediate_values()
+    output_dict = test_attention_intermediate_values()
+    breakpoint()
