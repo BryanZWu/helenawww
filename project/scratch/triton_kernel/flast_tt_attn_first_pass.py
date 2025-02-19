@@ -254,8 +254,6 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
     off_b = off_bh // h         # Batch index
     off_h = off_bh % h          # Head index
     
-    breakpoint()
-    
     # Calculate base offset for current batch and head, and also first dim of N
     # (which is effectively just another dim to batch along for now)
     # Note that we assume similar strides for Q, K, V, as the original
@@ -963,30 +961,93 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
     # Return TFLOPS
     return total_flops * 1e-12 / (ms * 1e-3)
 
+@torch.no_grad()
+def reference_tt_attn(q, k, v, b, sm_scale):
+    """
+    Reference implementation of attention for correctness.
+    """
+    Z, H, N_CTX = q.shape[:3]
+    # Step 1: QK^T. 
+    qk = torch.matmul(q, k.transpose(-2, -1))
+    
+    # Step 2: Scale and add bias--attn scaling happens before bias addition
+    qk_scaled = qk * sm_scale 
+    qk_scaled_bias = qk_scaled + b.view(Z, H, 1, N_CTX, N_CTX)
+
+    # Step 3: Softmax
+    p = torch.softmax(qk_scaled_bias.float(), dim=-1).half()
+
+    # Step 4: Output
+    ref_out = torch.matmul(p, v)
+    return {
+        "qk": qk,
+        "qk_scaled": qk_scaled,
+        "qk_scaled_bias": qk_scaled_bias,
+        "p": p,
+        "ref_out": ref_out,
+    }
+
+@torch.no_grad()
+def reference_tt_tiled(q, k, v, b, sm_scale, dout, BLOCK_N):
+    """
+    CPU-computed, but in the same style as flash attention--tiling,
+    keeping track of the current max value of QK, etc
+    """
+    Z, H, N_CTX = q.shape[:3]
+    for pid2 in range(Z * H):
+        z, h = divmod(pid2, H)
+        for pid1 in range(N_CTX):
+            n1 = pid1
+            for pid2 in range(N_CTX):
+                n2 = pid2
+                q_slice = q[z, h, n1, n2, :]
+                k_slice = k[z, h, n1, n2, :]
+                v_slice = v[z, h, n1, n2, :]
 
 def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16):
     """
     Test function that prints intermediate values for debugging
+
+    Steps for debugging:
+    1. We pick a specific set of indices for B, H, N1:
+      - B = 1, H = 2, N1 = 4
+      - QN2 ranges (64, 128] -- check second block
+      - these (corresponds to a single block)
+    2. Run reference implementation, and triton implementation, and check the following:
+        for attn_forward_inner, pid = (1, 4, 6) # 1 for N2, 4 for N1, 6 for B
+        a. QK matmul for each segment in the loop (BLOCK_N)
+            should be exactly the same as reference qk[1, 2, 4, 64:128, start_n:start_n+BLOCK_N]
+        b. QK + bias should be exactly the same in the same places
+        c. Maximum value of QK should equal whatever was up to that point. For
+            the reference implementation, compute current max value of QK on a per-
+            block basis.
+        d. TODO
     """
     torch.manual_seed(20)
     
-    # Initialize input tensors
-    q = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
-    k = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
-    v = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
-    b = torch.ones((Z, H, N_CTX, N_CTX), device=DEVICE)
+    debug_using_linear = False
+    def randlin(shape):
+        total_nel = torch.prod(torch.tensor(shape))
+        return torch.arange(total_nel, device=DEVICE).reshape(shape)
+    if debug_using_linear:
+        q = randlin((Z, H, N_CTX, N_CTX, HEAD_DIM))
+        k = randlin((Z, H, N_CTX, N_CTX, HEAD_DIM))
+        v = randlin((Z, H, N_CTX, N_CTX, HEAD_DIM))
+        b = randlin((Z, H, N_CTX, N_CTX))
+    else:
+        # Initialize input tensors
+        q = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+        k = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+        v = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+        b = torch.ones((Z, H, N_CTX, N_CTX), device=DEVICE)
     sm_scale = 0.5
 
-    # Print input statistics
-    print("Input tensor statistics:")
-    print(f"Q mean: {q.mean():.4f}, std: {q.std():.4f}")
-    print(f"K mean: {k.mean():.4f}, std: {k.std():.4f}")
-    print(f"V mean: {v.mean():.4f}, std: {v.std():.4f}")
-    
     # Compute reference implementation
     print("\nComputing reference implementation...")
     with torch.no_grad():
-        # Step 1: QK^T
+        # First thing to check:
+        # Step 1: QK^T. 
+        breakpoint()
         qk = torch.matmul(q, k.transpose(-2, -1))
         print(f"QK^T stats - mean: {qk.mean():.4f}, std: {qk.std():.4f}")
         
