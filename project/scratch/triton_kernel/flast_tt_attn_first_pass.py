@@ -45,6 +45,14 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     """
     lo, hi = 0, N_CTX
 
+    # Add debug prints for first thread
+    if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+        tl.debug_barrier()
+        tl.device_print("start_qn2:", start_qn2)
+        tl.device_print("BLOCK_M:", BLOCK_M)
+        tl.device_print("BLOCK_N:", BLOCK_N)
+        tl.device_print("q shape:", q.shape[0], q.shape[1])
+
     # Advance block pointers to correct starting positions
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
@@ -54,9 +62,20 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         
-        # Compute attention scores (Q * K^T)
+        if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+            tl.device_print("Processing block start_n:", start_n)
+        
+        # Load and print K block shape
         k = tl.load(K_block_ptr)
+        if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+            tl.device_print("k shape:", k.shape[0], k.shape[1])
+        
         qk = tl.dot(q, k)
+        
+        # Print QK shape and some values
+        if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+            tl.device_print("qk shape:", qk.shape[0], qk.shape[1])
+            # tl.device_print("qk[0,0]:", qk[0,0])
 
         # Apply attention bias 
         b = tl.load(B_block_ptr)
@@ -208,8 +227,19 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
 
     (n1/n2 is not the same as N!)
     """
+    # Add debug prints for first thread
+    if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+        tl.debug_barrier()
+        tl.device_print("Grid dims:", tl.num_programs(0), tl.num_programs(1), tl.num_programs(2))
+        tl.device_print("Block sizes: BLOCK_M=", BLOCK_M)
+        tl.device_print("BLOCK_N=", BLOCK_N)
+        tl.device_print("Input dims: b=", b)
+        tl.device_print("h=", h)
+        tl.device_print("n=", n)
+        tl.device_print("d=", d)
+
     # Ensure block size doesn't exceed head dimension
-    tl.static_assert(BLOCK_N <= d)
+    tl.static_assert(BLOCK_N <= d, "Block size (BLOCK_N) must not exceed head dimension (d)")
     
     # Grid dimension explanation:
     # - program_id(0): Indexes along inner sequence length (N_CTX/BLOCK_M blocks)
@@ -223,6 +253,8 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
     # Convert combined batch-head index into separate indices
     off_b = off_bh // h         # Batch index
     off_h = off_bh % h          # Head index
+    
+    breakpoint()
     
     # Calculate base offset for current batch and head, and also first dim of N
     # (which is effectively just another dim to batch along for now)
@@ -299,7 +331,7 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0          # Sum for normalization
     acc = tl.zeros([BLOCK_M, d], dtype=tl.float32)      # Accumulated attention outputs
 
-    # Scale factor for attention scores (includes log2 conversion for numerical stability)
+    # softmax scaling factor--since we use log2, we need to scale by 1/log(2)
     qk_scale = sm_scale * 1.44269504  # 1.44269504 = 1/log(2)
 
     # Load query block - remains in SRAM throughout computation
@@ -684,14 +716,12 @@ class _attention(torch.autograd.Function):
         # Initialize scaling factor storage
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
 
-        # Regular implementation path
         def grid(args):
-            return (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+            return (triton.cdiv(q.shape[-2], args["BLOCK_M"]), q.shape[-3], q.shape[0] * q.shape[1])
         
         ctx.grid = grid
         
         # Launch regular kernel
-        # breakpoint()
         _attn_fwd[grid](
             q, k, v, b, sm_scale, M, o,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
@@ -782,7 +812,7 @@ class _attention(torch.autograd.Function):
 attention = _attention.apply
 
 
-@pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 1024, 64)])
+@pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 1024, 32)])
 def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
     """
     Test function for attention implementation
@@ -801,6 +831,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
     # Reference implementation using PyTorch
     b = torch.ones((Z, H, N_CTX, N_CTX), device=DEVICE)
     p = torch.matmul(q, k.transpose(3, 4)) * sm_scale  # Compute attention scores
+    p = p + b.view(Z, H, 1, N_CTX, N_CTX)
     p = torch.softmax(p.float(), dim=-1).half()  # Apply softmax
     ref_out = torch.matmul(p, v)  # Compute attention output
     
@@ -814,7 +845,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
     tri_out = attention(q, k, v, b, sm_scale).half()
 
     # Compare results--forward pass
-    breakpoint() # DEBUG: looks like large parts of B is not touched for now--definitely a bug somewhere
+    # Updated debug: only 2 of the 256 elements of N1 is written to. 
+    # for (B, H, N1, N, C), the first 2 of N1 are written to. 
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
 
     backwards_pass_implemented = False
@@ -932,7 +964,58 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
     return total_flops * 1e-12 / (ms * 1e-3)
 
 
+def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16):
+    """
+    Test function that prints intermediate values for debugging
+    """
+    torch.manual_seed(20)
+    
+    # Initialize input tensors
+    q = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+    k = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+    v = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+    b = torch.ones((Z, H, N_CTX, N_CTX), device=DEVICE)
+    sm_scale = 0.5
+
+    # Print input statistics
+    print("Input tensor statistics:")
+    print(f"Q mean: {q.mean():.4f}, std: {q.std():.4f}")
+    print(f"K mean: {k.mean():.4f}, std: {k.std():.4f}")
+    print(f"V mean: {v.mean():.4f}, std: {v.std():.4f}")
+    
+    # Compute reference implementation
+    print("\nComputing reference implementation...")
+    with torch.no_grad():
+        # Step 1: QK^T
+        qk = torch.matmul(q, k.transpose(-2, -1))
+        print(f"QK^T stats - mean: {qk.mean():.4f}, std: {qk.std():.4f}")
+        
+        # Step 2: Scale and add bias--attn scaling happens before bias addition
+        qk = qk * sm_scale + b.view(Z, H, 1, N_CTX, N_CTX)
+        print(f"After scale+bias - mean: {qk.mean():.4f}, std: {qk.std():.4f}")
+        
+        # Step 3: Softmax
+        p = torch.softmax(qk.float(), dim=-1).half()
+        print(f"After softmax - mean: {p.mean():.4f}, std: {p.std():.4f}")
+        
+        # Step 4: Output
+        ref_out = torch.matmul(p, v)
+        print(f"Output stats - mean: {ref_out.mean():.4f}, std: {ref_out.std():.4f}")
+    
+    # Compute Triton implementation
+    print("\nComputing Triton implementation...")
+    tri_out = attention(q, k, v, b, sm_scale)
+    print(f"Triton output stats - mean: {tri_out.mean():.4f}, std: {tri_out.std():.4f}")
+    
+    # Compare results
+    max_diff = (ref_out - tri_out).abs().max().item()
+    print(f"\nMaximum absolute difference: {max_diff:.4f}")
+    
+    return ref_out, tri_out
+
+
 if __name__ == "__main__":
     # Run benchmarks (only works on post-Ampere GPUs)
     # bench_flash_attention.run(save_path=".", print_data=True)
-    test_op(Z=1, H=2, N_CTX=256, HEAD_DIM=32, dtype=torch.float16)
+    # test_op(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16)
+    ref_out, tri_out = test_attention_intermediate_values()
