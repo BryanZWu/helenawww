@@ -1,6 +1,5 @@
 import pytest
 import torch
-import triton.tools.experimental_descriptor
 
 import triton
 import triton.language as tl
@@ -11,7 +10,7 @@ import triton.language as tl
 # correctness issues outside of the _attn_fwd_tma kernel
 
 # Get the active torch device (GPU)
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 # Helper function to check if we're using HIP (AMD) backend
 def is_hip():
@@ -1069,6 +1068,18 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
 
 
 if __name__ == "__main__":
-    # Run benchmarks (only works on post-Ampere GPUs)
-    bench_flash_attention.run(save_path=".", print_data=True)
+    # Initialize CUDA context before running tests
+    if torch.cuda.is_available():
+        torch.cuda.init()
+        # # Optional: you can also explicitly set the device
+        # torch.cuda.set_device(0)
+    
+    # Run test
+    print("Running attention test...")
+    test_op(Z=1, H=2, N_CTX=1024, HEAD_DIM=64, causal=True)
+    print("Test completed successfully!")
+
+    # # Run benchmarks (only works on post-Ampere GPUs)
+    # print("\nRunning benchmarks...")
+    # bench_flash_attention.run(save_path=".", print_data=True)
 

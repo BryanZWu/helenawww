@@ -669,7 +669,8 @@ class _attention(torch.autograd.Function):
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         
         # Initialize output tensor
-        o = torch.empty_like(q)
+        # o = torch.empty_like(q)
+        o = torch.zeros_like(q)
         
         
         # Setup kernel arguments
@@ -798,8 +799,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
     dout = torch.randn_like(q)
     
     # Reference implementation using PyTorch
-    b = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))  # Causal mask
-    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale  # Compute attention scores
+    b = torch.ones((Z, H, N_CTX, N_CTX), device=DEVICE)
+    p = torch.matmul(q, k.transpose(3, 4)) * sm_scale  # Compute attention scores
     p = torch.softmax(p.float(), dim=-1).half()  # Apply softmax
     ref_out = torch.matmul(p, v)  # Compute attention output
     
@@ -811,22 +812,27 @@ def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
     
     # Triton implementation
     tri_out = attention(q, k, v, b, sm_scale).half()
-    tri_out.backward(dout)
-    tri_dv, v.grad = v.grad.clone(), None
-    tri_dk, k.grad = k.grad.clone(), None
-    tri_dq, q.grad = q.grad.clone(), None
-    
+
     # Compare results--forward pass
+    breakpoint() # DEBUG: looks like large parts of B is not touched for now--definitely a bug somewhere
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
-    rtol = 0.0
-    # Handle special case for AMD MI200 GPU
-    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
-        rtol = 1e-2  # Adjust tolerance for known hardware limitation
+
+    backwards_pass_implemented = False
+    if backwards_pass_implemented:
+        tri_out.backward(dout)
+        tri_dv, v.grad = v.grad.clone(), None
+        tri_dk, k.grad = k.grad.clone(), None
+        tri_dq, q.grad = q.grad.clone(), None
     
-    # Verify gradients match
-    assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=rtol)
-    assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=rtol)
-    assert torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=rtol)
+        rtol = 0.0
+        # Handle special case for AMD MI200 GPU
+        if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
+            rtol = 1e-2  # Adjust tolerance for known hardware limitation
+        
+        # Verify gradients match
+        assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=rtol)
+        assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=rtol)
+        assert torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=rtol)
 
 
 try:
@@ -837,7 +843,7 @@ except BaseException:
 
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
 # BATCH, N_HEADS, HEAD_DIM = 4, 32, 64 # To test on A100
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 64 # To test on L4
+BATCH, N_HEADS, HEAD_DIM = 4, 8, 32 # To test on L4
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
@@ -846,7 +852,7 @@ for mode in ["fwd", "bwd"]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["N_CTX"],
-            x_vals=[2**i for i in range(3, 5)], # will want to check this later
+            x_vals=[2**i for i in range(4, 7)], # will want to check this later
             line_arg="provider",
             line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
             (["flash"] if HAS_FLASH else []),
@@ -928,4 +934,5 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
 
 if __name__ == "__main__":
     # Run benchmarks (only works on post-Ampere GPUs)
-    bench_flash_attention.run(save_path=".", print_data=True)
+    # bench_flash_attention.run(save_path=".", print_data=True)
+    test_op(Z=1, H=2, N_CTX=256, HEAD_DIM=32, dtype=torch.float16)
