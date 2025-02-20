@@ -585,13 +585,30 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
     return total_flops * 1e-12 / (ms * 1e-3)
 
 @torch.no_grad()
-def reference_tt_attn(q, k, v, b, sm_scale):
+def reference_tt_attn(q, k, v, b, sm_scale, debugging_dict=None):
     """
     Reference implementation of attention for correctness.
+
+    If a debugging_dict is provided, we will check intermediate values against the debugging_dict.
     """
     Z, H, N_CTX = q.shape[:3]
     # Step 1: QK^T. 
     qk = torch.matmul(q, k.transpose(-2, -1))
+
+    if debugging_dict is not None:
+        # Checking against what the tiled version got
+        debugging_z = debugging_dict["debugging_z"]
+        debugging_h = debugging_dict["debugging_h"]
+        debugging_n1 = debugging_dict["debugging_n1"]
+        debugging_BLOCK_N = debugging_dict["BLOCK_N"]
+        qk_to_check = qk[debugging_z, debugging_h, debugging_n1, :, :]
+        for i in range(0, N_CTX, debugging_BLOCK_N):
+            end_i = min(i + debugging_BLOCK_N, N_CTX)
+            qk_to_check_block = qk_to_check[i:end_i, :]
+            tiled_qk_block = debugging_dict["qk"][i // debugging_BLOCK_N]
+            breakpoint()
+            assert torch.allclose(qk_to_check_block, tiled_qk_block, atol=1e-2, rtol=0)
+        debugging_dict["qk"] = qk
 
     # Step 2: Scale and add bias--attn scaling happens before bias addition
     qk_scaled = qk * sm_scale 
@@ -611,7 +628,7 @@ def reference_tt_attn(q, k, v, b, sm_scale):
     }
 
 @torch.no_grad()
-def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64):
+def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
     """
     CPU-computed reference implementation that follows the same tiling strategy as flash attention.
     This matches the Triton kernel's block-based computation pattern for easier debugging.
@@ -637,79 +654,87 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64):
         "l_i": l_i,
     }
 
+    debugging_z = 1
+    debugging_h = 2
+    debugging_n1 = 4
+
     # Process each batch and head
     for z in range(Z):
         for h in range(H):
             # Process each outer sequence position
             for n1 in range(N_CTX):
-                save_debugging = (z == 1) and (h == 2) and (n1 == 4)
-                if save_debugging:
-                    to_save = {
-                        "q_block": [],
-                        "k_block": [],
-                        "v_block": [],
-                        "b_block": [],
-                        "qk": [],
-                        "qk_scaled": [],
-                        "qk_scaled_bias": [],
-                        "qk_scaled_bias_minus_max": [],
-                        "p": [],
-                    }
-                # Process blocks of inner sequence
-                for start_n in range(0, N_CTX, BLOCK_N):
-
-                    end_n = min(start_n + BLOCK_N, N_CTX)
-                    block_size = end_n - start_n
-
-                    # Get current block of query, key, value
-                    q_block = q[z, h, n1, :, :]  # [N_CTX, D]
-                    k_block = k[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
-                    v_block = v[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
-                    b_block = b[z, h, n1, start_n:end_n]  # [BLOCK_N]
-
-                    # Compute attention scores for this block
-                    qk = torch.matmul(q_block, k_block.transpose(-2, -1))  # [N_CTX, BLOCK_N]
-                    qk_scaled = qk * sm_scale 
-                    qk_scaled_bias = qk_scaled + b_block
-
+                for start_m in range(0, N_CTX, BLOCK_M): # QN2--this is sharded across program_id(0)
+                    save_debugging = (z == debugging_z) and (h == debugging_h) and (n1 == debugging_n1)
                     if save_debugging:
-                        to_save["q_block"].append(q_block)
-                        to_save["k_block"].append(k_block)
-                        to_save["v_block"].append(v_block)
-                        to_save["b_block"].append(b_block)
-                        to_save["qk"].append(qk)
-                        to_save["qk_scaled"].append(qk_scaled)
-                        to_save["qk_scaled_bias"].append(qk_scaled_bias)
+                        to_save = {
+                            "q_block": [],
+                            "k_block": [],
+                            "v_block": [],
+                            "b_block": [],
+                            "qk": [],
+                            "qk_scaled": [],
+                            "qk_scaled_bias": [],
+                            "qk_scaled_bias_minus_max": [],
+                            "p": [],
+                            "debugging_z": debugging_z,
+                            "debugging_h": debugging_h,
+                            "debugging_n1": debugging_n1,
+                            "BLOCK_N": BLOCK_N,
+                        }
+                    # Process blocks of inner sequence
+                    for start_n in range(0, N_CTX, BLOCK_N):  # This loop is equivalent to the inner loop in the triton kernel
+                        end_n = min(start_n + BLOCK_N, N_CTX)
+                        block_size = end_n - start_n
 
-                    # Update running max scores
-                    m_ij = torch.max(qk_scaled_bias, dim=-1)[0]  # [N_CTX]
-                    m_i_new = torch.maximum(m_i[z, h, n1, :], m_ij)  # [N_CTX]
+                        # Get current block of query, key, value
+                        q_block = q[z, h, n1, :, :]  # [N_CTX, D]
+                        k_block = k[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
+                        v_block = v[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
+                        b_block = b[z, h, n1, start_n:end_n]  # [BLOCK_N]
 
-                    # Compute attention probabilities
-                    qk_scaled_bias_minus_max = qk_scaled_bias - m_i_new.unsqueeze(-1)  # Subtract new max for stability
-                    p = torch.exp2(qk_scaled_bias_minus_max)  # [N_CTX, BLOCK_N]
+                        # Compute attention scores for this block
+                        qk = torch.matmul(q_block, k_block.transpose(-2, -1))  # [N_CTX, BLOCK_N]
+                        qk_scaled = qk * sm_scale 
+                        qk_scaled_bias = qk_scaled + b_block
 
-                    if save_debugging:
-                        to_save["qk_scaled_bias_minus_max"].append(qk_scaled_bias_minus_max)
-                        to_save["p"].append(p)
-                        out_dict["debugging_intermediate_values"] = to_save
+                        if save_debugging:
+                            to_save["q_block"].append(q_block)
+                            to_save["k_block"].append(k_block)
+                            to_save["v_block"].append(v_block)
+                            to_save["b_block"].append(b_block)
+                            to_save["qk"].append(qk)
+                            to_save["qk_scaled"].append(qk_scaled)
+                            to_save["qk_scaled_bias"].append(qk_scaled_bias)
 
-                    # Update sum for normalization
-                    l_ij = torch.sum(p, dim=-1)  # [N_CTX]
-                    alpha = torch.exp2(m_i[z, h, n1, :] - m_i_new)  # [N_CTX]
-                    l_i[z, h, n1, :] = l_i[z, h, n1, :] * alpha + l_ij
+                        # Update running max scores
+                        m_ij = torch.max(qk_scaled_bias, dim=-1)[0]  # [N_CTX]
+                        m_i_new = torch.maximum(m_i[z, h, n1, :], m_ij)  # [N_CTX]
 
-                    # Update output accumulator
-                    # Scale current output by alpha for stability
-                    out[z, h, n1, :, :] = out[z, h, n1, :, :] * alpha.unsqueeze(-1)
-                    # Add contribution from current block
-                    out[z, h, n1, :, :] = out[z, h, n1, :, :] + torch.matmul(p, v_block)
+                        # Compute attention probabilities
+                        qk_scaled_bias_minus_max = qk_scaled_bias - m_i_new.unsqueeze(-1)  # Subtract new max for stability
+                        p = torch.exp2(qk_scaled_bias_minus_max)  # [N_CTX, BLOCK_N]
 
-                    # Update max scores for next iteration
-                    m_i[z, h, n1, :] = m_i_new
+                        if save_debugging:
+                            to_save["qk_scaled_bias_minus_max"].append(qk_scaled_bias_minus_max)
+                            to_save["p"].append(p)
+                            out_dict["debugging_intermediate_values"] = to_save
 
-                # Final normalization
-                out[z, h, n1, :, :] = out[z, h, n1, :, :] / l_i[z, h, n1, :].unsqueeze(-1)
+                        # Update sum for normalization
+                        l_ij = torch.sum(p, dim=-1)  # [N_CTX]
+                        alpha = torch.exp2(m_i[z, h, n1, :] - m_i_new)  # [N_CTX]
+                        l_i[z, h, n1, :] = l_i[z, h, n1, :] * alpha + l_ij
+
+                        # Update output accumulator
+                        # Scale current output by alpha for stability
+                        out[z, h, n1, :, :] = out[z, h, n1, :, :] * alpha.unsqueeze(-1)
+                        # Add contribution from current block
+                        out[z, h, n1, :, :] = out[z, h, n1, :, :] + torch.matmul(p, v_block)
+
+                        # Update max scores for next iteration
+                        m_i[z, h, n1, :] = m_i_new
+
+                    # Final normalization
+                    out[z, h, n1, :, :] = out[z, h, n1, :, :] / l_i[z, h, n1, :].unsqueeze(-1)
 
     return out_dict
 
@@ -753,7 +778,10 @@ def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, BLOCK_N
     print("\nComputing CPU-tiled implementation...")
     tiled_out_dict = reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N)
     tiled_out = tiled_out_dict["out"]
-    print(f"Tiled output stats - mean: {tiled_out.mean():.4f}, std: {tiled_out.std():.4f}")
+    debugging_dict = tiled_out_dict["debugging_intermediate_values"]
+
+    print("\nComputing CPU default implementation...")
+    gt_out_dict = reference_tt_attn(q, k, v, b, sm_scale, debugging_dict=debugging_dict)
 
     # Check specific positions
     # Look at a specific batch, head, and sequence position
