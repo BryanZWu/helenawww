@@ -410,6 +410,25 @@ for mode in ["fwd", "bwd"]:
                 "metric": "memory",
             },
         ))
+    # Add latency benchmark
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=["N_CTX"],
+            x_vals=[2**i for i in range(4, 13)],
+            line_arg="provider",
+            line_vals=["triton-fp16", "vanilla-torch"], # "sdpa-kernel"],
+            line_names=["Triton [FP16]", "Vanilla PyTorch"], # "SDPA Kernel"],
+            styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+            ylabel="Time (ms)",
+            plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-latency",
+            args={
+                "H": N_HEADS,
+                "BATCH": BATCH,
+                "HEAD_DIM": HEAD_DIM,
+                "mode": mode,
+                "metric": "time",
+            },
+        ))
 
 @triton.testing.perf_report(configs)
 def bench_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE, metric="tflops"):
@@ -478,6 +497,8 @@ def bench_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE, me
 
         if metric == "memory":
             return peak_mem
+        elif metric == "time":
+            return ms  # Return raw milliseconds
         else:  # tflops
             flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
             total_flops = 2 * flops_per_matmul
