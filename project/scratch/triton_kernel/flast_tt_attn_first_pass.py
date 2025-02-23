@@ -405,7 +405,9 @@ class _attention(torch.autograd.Function):
             extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
         # Initialize scaling factor storage
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        # M is the max val for each query position--QN2.
+        # Shape (B, H, N1, N2), equivalent to attn_scores.max(dim=-1)
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2], q.shape[3]), device=q.device, dtype=torch.float32)
 
         def grid(args):
             return (triton.cdiv(q.shape[-2], args["BLOCK_M"]), q.shape[-3], q.shape[0] * q.shape[1])
@@ -600,13 +602,14 @@ def reference_tt_attn(q, k, v, b, sm_scale, debugging_dict=None):
         debugging_z = debugging_dict["debugging_z"]
         debugging_h = debugging_dict["debugging_h"]
         debugging_n1 = debugging_dict["debugging_n1"]
+        debugging_m1 = debugging_dict["debugging_m1"]
         debugging_BLOCK_N = debugging_dict["BLOCK_N"]
-        qk_to_check = qk[debugging_z, debugging_h, debugging_n1, :, :]
+        debugging_BLOCK_M = debugging_dict["BLOCK_M"]
+        qk_to_check = qk[debugging_z, debugging_h, debugging_n1, debugging_m1:debugging_m1+debugging_BLOCK_M, :]
         for i in range(0, N_CTX, debugging_BLOCK_N):
             end_i = min(i + debugging_BLOCK_N, N_CTX)
-            qk_to_check_block = qk_to_check[i:end_i, :]
+            qk_to_check_block = qk_to_check[:, i:end_i]
             tiled_qk_block = debugging_dict["qk"][i // debugging_BLOCK_N]
-            breakpoint()
             assert torch.allclose(qk_to_check_block, tiled_qk_block, atol=1e-2, rtol=0)
         debugging_dict["qk"] = qk
 
@@ -643,20 +646,23 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
     """
     Z, H, N_CTX, _, D = q.shape
     out = torch.zeros_like(q)
+    
+    # 1 if we set the output at all--basically a coverage check
+    out_set = torch.zeros_like(q)
 
-    # Initialize tracking tensors for each query position
-    m_i = torch.full((Z, H, N_CTX, N_CTX), float('-inf'), device=q.device)  # Max scores
-    l_i = torch.ones((Z, H, N_CTX, N_CTX), device=q.device)  # Sum for normalization
+    # These are filled in in blocks from the inner loop.
+    m_agg = torch.full((Z, H, N_CTX, N_CTX), float('-inf'), device=q.device)  # Max scores
 
     out_dict = {
         "out": out,
-        "m_i": m_i,
-        "l_i": l_i,
+        # "m_i": m_i,
+        # "l_i": l_i,
     }
 
     debugging_z = 1
     debugging_h = 2
     debugging_n1 = 4
+    debugging_m1 = 64
 
     # Process each batch and head
     for z in range(Z):
@@ -664,7 +670,11 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
             # Process each outer sequence position
             for n1 in range(N_CTX):
                 for start_m in range(0, N_CTX, BLOCK_M): # QN2--this is sharded across program_id(0)
-                    save_debugging = (z == debugging_z) and (h == debugging_h) and (n1 == debugging_n1)
+                    m_i = torch.full((BLOCK_M,), float('-inf'), device=q.device)
+                    l_i = torch.full((BLOCK_M,), 1.0, device=q.device)
+                    acc = torch.zeros((BLOCK_M, D), device=q.device)
+                    end_m = min(start_m + BLOCK_M, N_CTX)
+                    save_debugging = (z == debugging_z) and (h == debugging_h) and (n1 == debugging_n1) and (start_m == debugging_m1)
                     if save_debugging:
                         to_save = {
                             "q_block": [],
@@ -679,7 +689,9 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                             "debugging_z": debugging_z,
                             "debugging_h": debugging_h,
                             "debugging_n1": debugging_n1,
+                            "debugging_m1": debugging_m1,
                             "BLOCK_N": BLOCK_N,
+                            "BLOCK_M": BLOCK_M,
                         }
                     # Process blocks of inner sequence
                     for start_n in range(0, N_CTX, BLOCK_N):  # This loop is equivalent to the inner loop in the triton kernel
@@ -687,7 +699,7 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                         block_size = end_n - start_n
 
                         # Get current block of query, key, value
-                        q_block = q[z, h, n1, :, :]  # [N_CTX, D]
+                        q_block = q[z, h, n1, start_m:end_m, :]  # [BLOCK_M, D]
                         k_block = k[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
                         v_block = v[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
                         b_block = b[z, h, n1, start_n:end_n]  # [BLOCK_N]
@@ -707,11 +719,11 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                             to_save["qk_scaled_bias"].append(qk_scaled_bias)
 
                         # Update running max scores
-                        m_ij = torch.max(qk_scaled_bias, dim=-1)[0]  # [N_CTX]
-                        m_i_new = torch.maximum(m_i[z, h, n1, :], m_ij)  # [N_CTX]
+                        m_ij = torch.max(qk_scaled_bias, dim=-1)[0]  # [BLOCK_M]
+                        m_ij = torch.maximum(m_i, m_ij)  # [BLOCK_M]
 
                         # Compute attention probabilities
-                        qk_scaled_bias_minus_max = qk_scaled_bias - m_i_new.unsqueeze(-1)  # Subtract new max for stability
+                        qk_scaled_bias_minus_max = qk_scaled_bias - m_ij.unsqueeze(-1)  # Subtract new max for stability
                         p = torch.exp2(qk_scaled_bias_minus_max)  # [N_CTX, BLOCK_N]
 
                         if save_debugging:
@@ -720,21 +732,17 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                             out_dict["debugging_intermediate_values"] = to_save
 
                         # Update sum for normalization
-                        l_ij = torch.sum(p, dim=-1)  # [N_CTX]
-                        alpha = torch.exp2(m_i[z, h, n1, :] - m_i_new)  # [N_CTX]
-                        l_i[z, h, n1, :] = l_i[z, h, n1, :] * alpha + l_ij
-
-                        # Update output accumulator
-                        # Scale current output by alpha for stability
-                        out[z, h, n1, :, :] = out[z, h, n1, :, :] * alpha.unsqueeze(-1)
-                        # Add contribution from current block
-                        out[z, h, n1, :, :] = out[z, h, n1, :, :] + torch.matmul(p, v_block)
+                        l_ij = torch.sum(p, dim=-1)  # [BLOCK_M]
+                        alpha = torch.exp2(m_i - m_ij)
+                        l_i = l_i * alpha + l_ij
+                        acc = acc * alpha[:, None] + p @ v_block
 
                         # Update max scores for next iteration
-                        m_i[z, h, n1, :] = m_i_new
+                        m_i = m_ij
 
-                    # Final normalization
-                    out[z, h, n1, :, :] = out[z, h, n1, :, :] / l_i[z, h, n1, :].unsqueeze(-1)
+                        # Final normalization
+                        acc = acc / l_i[:, None]
+                        out[z, h, n1, start_m:end_m, :] = acc
 
     return out_dict
 
@@ -782,34 +790,8 @@ def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, BLOCK_N
 
     print("\nComputing CPU default implementation...")
     gt_out_dict = reference_tt_attn(q, k, v, b, sm_scale, debugging_dict=debugging_dict)
-
-    # Check specific positions
-    # Look at a specific batch, head, and sequence position
-    b_idx, h_idx, n1_idx = 1, 2, 4  # These match the indices mentioned in the debugging steps
-    print(f"\nChecking specific position (b={b_idx}, h={h_idx}, n1={n1_idx}):")
-    gt_slice = gt_out[b_idx, h_idx, n1_idx]
-    tiled_slice = tiled_out[b_idx, h_idx, n1_idx]
-    slice_max_diff = (gt_slice - tiled_slice).abs().max().item()
-    slice_mean_diff = (gt_slice - tiled_slice).abs().mean().item()
-    print(f"Slice maximum absolute difference: {slice_max_diff:.4f}")
-    print(f"Slice mean absolute difference: {slice_mean_diff:.4f}")
-
-    # Compare results
-    max_diff = (gt_out - tiled_out).abs().max().item()
-    mean_diff = (gt_out - tiled_out).abs().mean().item()
-    print(f"\nDifferences between implementations:")
-    print(f"Maximum absolute difference: {max_diff:.4f}")
-    print(f"Mean absolute difference: {mean_diff:.4f}")
-
-    return {
-        "ground_truth": gt_results,
-        "tiled_output": tiled_out,
-        "max_diff": max_diff,
-        "mean_diff": mean_diff
-    }
-
-
-
+    assert torch.allclose(tiled_out, gt_out_dict["ref_out"], atol=1e-2, rtol=0)
+    return gt_out_dict
 
 if __name__ == "__main__":
     # Run benchmarks (only works on post-Ampere GPUs)
