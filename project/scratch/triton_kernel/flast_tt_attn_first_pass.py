@@ -35,7 +35,7 @@ print("TMA benchmarks will be running without grid constant TMA descriptor.")
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     K_block_ptr, V_block_ptr, B_block_ptr, #
-                    start_qn2, qk_scale,  #
+                    start_qn2, pre_bias_qk_scale, post_bias_qk_scale, #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     offs_qn2: tl.constexpr, offs_kn2: tl.constexpr,  #
                     N_CTX: tl.constexpr, fp8_v: tl.constexpr):
@@ -46,12 +46,12 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     lo, hi = 0, N_CTX
 
     # Add debug prints for first thread
-    if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
-        tl.debug_barrier()
-        tl.device_print("start_qn2:", start_qn2)
-        tl.device_print("BLOCK_M:", BLOCK_M)
-        tl.device_print("BLOCK_N:", BLOCK_N)
-        tl.device_print("q shape:", q.shape[0], q.shape[1])
+    # if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+    #     tl.debug_barrier()
+    #     tl.device_print("start_qn2:", start_qn2)
+    #     tl.device_print("BLOCK_M:", BLOCK_M)
+    #     tl.device_print("BLOCK_N:", BLOCK_N)
+    #     tl.device_print("q shape:", q.shape[0], q.shape[1])
 
     # Advance block pointers to correct starting positions
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
@@ -77,9 +77,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
             tl.device_print("qk shape:", qk.shape[0], qk.shape[1])
             # tl.device_print("qk[0,0]:", qk[0,0])
 
-        # Apply attention bias 
+        # Apply attention bias, and scaling (pre-bias being 1/sqrt(head_dim) and post-bias being 1/log(2))
         b = tl.load(B_block_ptr)
-        qk = qk * qk_scale + b
+        qk = (qk * pre_bias_qk_scale + b) * post_bias_qk_scale
+
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk -= m_ij[:, None] # Subtract max value for numerical stability
 
@@ -109,61 +110,6 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         B_block_ptr = tl.advance(B_block_ptr, (0, BLOCK_N))
 
     return acc, l_i, m_i
-
-
-# @triton.jit
-# def _attn_fwd_inner_tma(acc, l_i, m_i, q,  #
-#                         desc_k, desc_v,  #
-#                         offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
-#                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
-#                         STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-#                         N_CTX: tl.constexpr):
-#     """
-#     TMA (Tensor Memory Access) version of the attention forward pass kernel
-#     Uses TMA descriptors for more efficient memory access patterns
-#     Similar to _attn_fwd_inner but optimized for TMA operations
-#     """
-#     # range of values handled by this stage
-#     if STAGE == 1:
-#         lo, hi = 0, start_m * BLOCK_M
-#     elif STAGE == 2:
-#         lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
-#         lo = tl.multiple_of(lo, BLOCK_M)
-#     # causal = False
-#     else:
-#         lo, hi = 0, N_CTX
-#     offsetkv_y = offset_y + lo
-#     # loop over k, v and update accumulator
-#     for start_n in range(lo, hi, BLOCK_N):
-#         start_n = tl.multiple_of(start_n, BLOCK_N)
-#         # -- compute qk ----
-#         k = tl._experimental_descriptor_load(desc_k, [offsetkv_y, 0], [BLOCK_N, HEAD_DIM], dtype).T
-#         qk = tl.dot(q, k)
-#         if STAGE == 2:
-#             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-#             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-#             m_ij = tl.maximum(m_i, tl.max(qk, 1))
-#             qk -= m_ij[:, None]
-#         else:
-#             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-#             qk = qk * qk_scale - m_ij[:, None]
-#         p = tl.math.exp2(qk)
-#         l_ij = tl.sum(p, 1)
-#         # -- update m_i and l_i
-#         alpha = tl.math.exp2(m_i - m_ij)
-#         l_i = l_i * alpha + l_ij
-#         # -- update output accumulator --
-#         acc = acc * alpha[:, None]
-#         # update acc
-#         v = tl._experimental_descriptor_load(desc_v, [offsetkv_y, 0], [BLOCK_N, HEAD_DIM], dtype)
-#         p = p.to(dtype)
-#         # note that this non transposed v for FP8 is only supported on Blackwell
-#         acc = tl.dot(p, v, acc)
-#         # update m_i and l_i
-#         m_i = m_ij
-#         offsetkv_y += BLOCK_N
-#     return acc, l_i, m_i
-
 
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
 # the code below and commenting out the equivalent parameters is convenient for
@@ -227,16 +173,16 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
 
     (n1/n2 is not the same as N!)
     """
-    # Add debug prints for first thread
-    if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
-        tl.debug_barrier()
-        tl.device_print("Grid dims:", tl.num_programs(0), tl.num_programs(1), tl.num_programs(2))
-        tl.device_print("Block sizes: BLOCK_M=", BLOCK_M)
-        tl.device_print("BLOCK_N=", BLOCK_N)
-        tl.device_print("Input dims: b=", b)
-        tl.device_print("h=", h)
-        tl.device_print("n=", n)
-        tl.device_print("d=", d)
+    # # Add debug prints for first thread
+    # if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+    #     tl.debug_barrier()
+    #     tl.device_print("Grid dims:", tl.num_programs(0), tl.num_programs(1), tl.num_programs(2))
+    #     tl.device_print("Block sizes: BLOCK_M=", BLOCK_M)
+    #     tl.device_print("BLOCK_N=", BLOCK_N)
+    #     tl.device_print("Input dims: b=", b)
+    #     tl.device_print("h=", h)
+    #     tl.device_print("n=", n)
+    #     tl.device_print("d=", d)
 
     # Ensure block size doesn't exceed head dimension
     tl.static_assert(BLOCK_N <= d, "Block size (BLOCK_N) must not exceed head dimension (d)")
@@ -297,7 +243,7 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
     K_block_ptr = tl.make_block_ptr(
         base=K + qvk_offset,
         shape=(d, n),
-        strides=(stride_kn2, stride_kd),
+        strides=(stride_kd, stride_kn2),
         offsets=(0, 0),
         block_shape=(d, BLOCK_N),
         order=(0, 1),
@@ -329,27 +275,27 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0          # Sum for normalization
     acc = tl.zeros([BLOCK_M, d], dtype=tl.float32)      # Accumulated attention outputs
 
-    # softmax scaling factor--since we use log2, we need to scale by 1/log(2)
-    qk_scale = sm_scale * 1.44269504  # 1.44269504 = 1/log(2)
-
+    # # softmax scaling factor--since we use log2, we need to scale by 1/log(2)
+    pre_bias_qk_scale = sm_scale
+    post_bias_qk_scale = 1.44269504
     # Load query block - remains in SRAM throughout computation
     q = tl.load(Q_block_ptr)
 
     acc, l_i, m_i = _attn_fwd_inner(
         acc, l_i, m_i, q,
         K_block_ptr, V_block_ptr, B_block_ptr, #
-        start_qn2, qk_scale,  #
+        start_qn2, pre_bias_qk_scale, post_bias_qk_scale,  #
         BLOCK_M, d, BLOCK_N,  #
         offs_qn2, offs_kn2,
         n, V.dtype.element_ty == tl.float8e5  #
         )
 
     # Final processing:
-    # 1. Apply softmax normalization
-    # 2. Store softmax scaling factors (m_i) for backward pass
-    # 3. Store final output values
+    # 1. Compute logsumexp values for backward pass
     m_i += tl.math.log2(l_i)
+    # 2. Normalize softmax by dividing by denominator
     acc = acc / l_i[:, None]
+    # 3. Store outputs
     m_ptrs = M + off_bh * n + offs_qn2
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
@@ -468,8 +414,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
     tri_out = attention(q, k, v, b, sm_scale).half()
 
     # Compare results--forward pass
-    # Updated debug: only 2 of the 256 elements of N1 is written to. 
-    # for (B, H, N1, N, C), the first 2 of N1 are written to. 
+    breakpoint()
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
 
     backwards_pass_implemented = False
@@ -653,9 +598,16 @@ def reference_tt_attn(q, k, v, b, sm_scale, debugging_dict=None):
         debugging_m_i = debugging_dict["m_i"]
         debugging_m1 = debugging_dict["debugging_m1"]
         debugging_BLOCK_M = debugging_dict["BLOCK_M"]
+        debugging_BLOCK_N = debugging_dict["BLOCK_N"]
         m_i_to_check = m_i_with_log2[debugging_z, debugging_h, debugging_n1, debugging_m1:debugging_m1+debugging_BLOCK_M]
-        breakpoint()
         assert torch.allclose(debugging_m_i, m_i_to_check, atol=1e-2, rtol=0)
+
+        debugging_ps = debugging_dict["p"]
+        # only the last p is correct because of the m_i update. 
+        # Also note that "p" in the tiled case is actualyl exp only
+        p_to_check = debugging_ps[-1]
+        p_gt = exp_with_log2[debugging_z, debugging_h, debugging_n1, debugging_m1:debugging_m1+debugging_BLOCK_M, -debugging_BLOCK_N:]
+        assert torch.allclose(p_to_check, p_gt, atol=1e-2, rtol=0)
 
     # Step 4: Output
     ref_out = torch.matmul(p, v)
@@ -764,8 +716,8 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                         m_ij = torch.maximum(m_i, m_ij)  # [BLOCK_M]
 
                         # Compute attention probabilities
-                        qk_scaled_bias_minus_max = qk_scaled_bias - m_ij.unsqueeze(-1)  # Subtract new max for stability
-                        p = torch.exp2(qk_scaled_bias_minus_max)  # [N_CTX, BLOCK_N]
+                        qk_scaled_bias_minus_max = qk_scaled_bias_with_log2 - m_ij.unsqueeze(-1)  # Subtract new max for stability
+                        p = torch.exp2(qk_scaled_bias_minus_max)
 
                         if save_debugging:
                             to_save["qk_scaled_bias_minus_max"].append(qk_scaled_bias_minus_max)
@@ -780,9 +732,9 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                         # Update max scores for next iteration
                         m_i = m_ij
 
-                        # Final normalization
-                        acc = acc / l_i[:, None]
-                        out[z, h, n1, start_m:end_m, :] = acc
+                    # Final normalization
+                    acc = acc / l_i[:, None]
+                    out[z, h, n1, start_m:end_m, :] = acc
                     # At the end of the n loop for the specified m, we save m and l
                     m_agg[z, h, n1, start_m:end_m] = m_i
                     l_agg[z, h, n1, start_m:end_m] = l_i
@@ -842,6 +794,5 @@ def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, BLOCK_N
 if __name__ == "__main__":
     # Run benchmarks (only works on post-Ampere GPUs)
     # bench_flash_attention.run(save_path=".", print_data=True)
-    # test_op(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16)
-    output_dict = test_attention_intermediate_values()
-    breakpoint()
+    test_op(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16)
+    # output_dict = test_attention_intermediate_values()
