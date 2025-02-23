@@ -617,8 +617,45 @@ def reference_tt_attn(q, k, v, b, sm_scale, debugging_dict=None):
     qk_scaled = qk * sm_scale 
     qk_scaled_bias = qk_scaled + b.view(Z, H, 1, N_CTX, N_CTX)
 
-    # Step 3: Softmax
-    p = torch.softmax(qk_scaled_bias.float(), dim=-1)
+    if debugging_dict is not None:
+        # Checking against what the tiled version got
+        debugging_z = debugging_dict["debugging_z"]
+        debugging_h = debugging_dict["debugging_h"]
+        debugging_n1 = debugging_dict["debugging_n1"]
+        debugging_m1 = debugging_dict["debugging_m1"]
+        debugging_BLOCK_N = debugging_dict["BLOCK_N"]
+        debugging_BLOCK_M = debugging_dict["BLOCK_M"]
+        qk_scaled_bias_to_check = qk_scaled_bias[debugging_z, debugging_h, debugging_n1, debugging_m1:debugging_m1+debugging_BLOCK_M, :]
+        for i in range(0, N_CTX, debugging_BLOCK_N):
+            end_i = min(i + debugging_BLOCK_N, N_CTX)
+            qk_scaled_bias_to_check_block = qk_scaled_bias_to_check[:, i:end_i]
+            tiled_qk_scaled_bias_block = debugging_dict["qk_scaled_bias"][i // debugging_BLOCK_N]
+            assert torch.allclose(qk_scaled_bias_to_check_block, tiled_qk_scaled_bias_block, atol=1e-2, rtol=0)
+
+
+    # Step 3a: Softmax (builtin)
+    p_ref = torch.softmax(qk_scaled_bias.float(), dim=-1)
+    # Step 3b: Manual softmax 
+    m_i = torch.max(qk_scaled_bias, dim=-1)[0]
+    qk_scaled_bias_minus_max = qk_scaled_bias - m_i.unsqueeze(-1)
+    exp = torch.exp(qk_scaled_bias_minus_max)
+    p = exp / torch.sum(exp, dim=-1, keepdim=True)
+    assert torch.allclose(p_ref, p, atol=1e-2, rtol=0)
+    # Step 3c: Manual softmax with log2
+    qk_scaled_bias_with_log2 = qk_scaled_bias * 1.44269504 # 1.44269504 = 1/log(2)
+    m_i_with_log2 = torch.max(qk_scaled_bias_with_log2, dim=-1)[0]
+    qk_scaled_bias_minus_max_with_log2 = qk_scaled_bias_with_log2 - m_i_with_log2.unsqueeze(-1)
+    exp_with_log2 = torch.exp2(qk_scaled_bias_minus_max_with_log2)
+    p_with_log2 = exp_with_log2 / torch.sum(exp_with_log2, dim=-1, keepdim=True)
+    assert torch.allclose(p_ref, p_with_log2, atol=1e-2, rtol=0)
+
+    if debugging_dict is not None:
+        debugging_m_i = debugging_dict["m_i"]
+        debugging_m1 = debugging_dict["debugging_m1"]
+        debugging_BLOCK_M = debugging_dict["BLOCK_M"]
+        m_i_to_check = m_i_with_log2[debugging_z, debugging_h, debugging_n1, debugging_m1:debugging_m1+debugging_BLOCK_M]
+        breakpoint()
+        assert torch.allclose(debugging_m_i, m_i_to_check, atol=1e-2, rtol=0)
 
     # Step 4: Output
     ref_out = torch.matmul(p, v)
@@ -652,6 +689,7 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
 
     # These are filled in in blocks from the inner loop.
     m_agg = torch.full((Z, H, N_CTX, N_CTX), float('-inf'), device=q.device)  # Max scores
+    l_agg = torch.full((Z, H, N_CTX, N_CTX), 1.0, device=q.device)  # Normalization factor
 
     out_dict = {
         "out": out,
@@ -684,6 +722,7 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                             "qk": [],
                             "qk_scaled": [],
                             "qk_scaled_bias": [],
+                            "qk_scaled_bias_with_log2": [],
                             "qk_scaled_bias_minus_max": [],
                             "p": [],
                             "debugging_z": debugging_z,
@@ -708,6 +747,7 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                         qk = torch.matmul(q_block, k_block.transpose(-2, -1))  # [N_CTX, BLOCK_N]
                         qk_scaled = qk * sm_scale 
                         qk_scaled_bias = qk_scaled + b_block
+                        qk_scaled_bias_with_log2 = qk_scaled_bias * 1.44269504 # 1.44269504 = 1/log(2)
 
                         if save_debugging:
                             to_save["q_block"].append(q_block)
@@ -717,9 +757,10 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                             to_save["qk"].append(qk)
                             to_save["qk_scaled"].append(qk_scaled)
                             to_save["qk_scaled_bias"].append(qk_scaled_bias)
+                            to_save["qk_scaled_bias_with_log2"].append(qk_scaled_bias_with_log2)
 
                         # Update running max scores
-                        m_ij = torch.max(qk_scaled_bias, dim=-1)[0]  # [BLOCK_M]
+                        m_ij = torch.max(qk_scaled_bias_with_log2, dim=-1)[0]  # [BLOCK_M]
                         m_ij = torch.maximum(m_i, m_ij)  # [BLOCK_M]
 
                         # Compute attention probabilities
@@ -729,7 +770,6 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                         if save_debugging:
                             to_save["qk_scaled_bias_minus_max"].append(qk_scaled_bias_minus_max)
                             to_save["p"].append(p)
-                            out_dict["debugging_intermediate_values"] = to_save
 
                         # Update sum for normalization
                         l_ij = torch.sum(p, dim=-1)  # [BLOCK_M]
@@ -743,6 +783,12 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                         # Final normalization
                         acc = acc / l_i[:, None]
                         out[z, h, n1, start_m:end_m, :] = acc
+                    # At the end of the n loop for the specified m, we save m and l
+                    m_agg[z, h, n1, start_m:end_m] = m_i
+                    l_agg[z, h, n1, start_m:end_m] = l_i
+                    if save_debugging:
+                        to_save["m_i"] = m_i
+                        out_dict["debugging_intermediate_values"] = to_save
 
     return out_dict
 
