@@ -1,0 +1,500 @@
+'''
+Code adapted from the triton flash-attn-2.0 tutorial:
+https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html
+
+Modifications: 
+- In AF2 triangular attention, an additional bias is applied to the 
+  attention scores: "The decision whether edge ij will receive an
+  update from edge ik is not only determined by their
+  query-key similarity (as in standard attention [95]),
+  but also modulated by the information bjk derived from
+  the third edge jk of this triangle"
+- Triangle attention input is pw for all QKV: (B, H, N, N, D)
+'''
+
+import pytest
+import torch
+# import triton.tools.experimental_descriptor
+
+import triton
+import triton.language as tl
+
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+# Helper function to check if we're using HIP (AMD) backend
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+# Helper function to check if we're using CUDA backend
+def is_cuda():
+    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+print("TMA benchmarks will be running without grid constant TMA descriptor.")
+
+
+@triton.jit
+def _attn_fwd_inner(acc, l_i, m_i, q,  #
+                    K_block_ptr, V_block_ptr, B_block_ptr, #
+                    start_qn2, pre_bias_qk_scale, post_bias_qk_scale, #
+                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
+                    offs_qn2: tl.constexpr, offs_kn2: tl.constexpr,  #
+                    N_CTX: tl.constexpr, fp8_v: tl.constexpr):
+    """
+    Inner kernel for attention forward pass computation
+    Computes attention scores and updates accumulator for a block of the attention matrix
+    """
+    lo, hi = 0, N_CTX
+
+    # Advance block pointers to correct starting positions
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    B_block_ptr = tl.advance(B_block_ptr, (0, lo))
+
+    # Loop over the entire sequence of KV, accumulating (Q @ K)V
+    for start_n in range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        # Load and print K block shape
+        k = tl.load(K_block_ptr)
+
+        qk = tl.dot(q, k)
+
+        # Apply attention bias, and scaling (pre-bias being 1/sqrt(head_dim) and post-bias being 1/log(2))
+        b = tl.load(B_block_ptr)
+        qk = (qk * pre_bias_qk_scale + b) * post_bias_qk_scale
+
+        # Update new max value if needed. Subtract for stability
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
+
+        # Attn scores
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+
+        # Scale down prev denominator and numerator by exp(m_i - m_ij),
+        # if the max changed.
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
+
+        # Load V and compute attention output
+        v = tl.load(V_block_ptr)
+        if fp8_v:
+            p = p.to(tl.float8e5)  # Convert to FP8 if needed
+        else:
+            p = p.to(tl.float16)  # Otherwise use FP16
+        acc = tl.dot(p, v, acc)  # Update accumulator with attention values
+
+        m_i = m_ij
+
+        # Advance block pointers
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        B_block_ptr = tl.advance(B_block_ptr, (0, BLOCK_N))
+
+    return acc, l_i, m_i
+
+configs = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+    for BM in [64, 128]\
+    for BN in [32, 64]\
+    for s in ([1] if is_hip() else [3, 4, 7])\
+    for w in [4, 8]\
+]
+
+
+def keep(conf):
+    BLOCK_M = conf.kwargs["BLOCK_M"]
+    BLOCK_N = conf.kwargs["BLOCK_N"]
+    if BLOCK_M * BLOCK_N < 128 * 128 and conf.num_warps == 8:
+        return False
+    return True
+
+
+@triton.autotune(list(filter(keep, configs)), key=["n", "d"])
+@triton.jit
+def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for softmax, M: max values, Out: output tensor
+              stride_qb, stride_qh, stride_qn1, stride_qn2, stride_qd,  # Strides for Q tensor: batch, head, seq_len, seq_len, head_dim
+              stride_kb, stride_kh, stride_kn1, stride_kn2, stride_kd,  # Strides for K tensor
+              stride_vb, stride_vh, stride_vn1, stride_vn2, stride_vd,  # Strides for V tensor
+              stride_ob, stride_oh, stride_on1, stride_on2, stride_od,  # Strides for Output tensor
+              stride_bb, stride_bh, stride_bn1, stride_bn2,  # Strides for B tensor
+              b, h, n,  # b=batch_size, h=num_heads, n=sequence_length
+              d: tl.constexpr,  # Size of each attention head
+              BLOCK_M: tl.constexpr,  # Block size for sequence dimension
+              BLOCK_N: tl.constexpr,  # Block size for attention computation
+              ):
+    """
+    Attention forward pass kernel: 
+    Q: [b, h, n, n, d]
+    K: [b, h, n, n, d]
+    V: [b, h, n, n, d]
+    B: [b, h, n, n]
+
+
+    Naive implementation:
+    1. attn_logits = Q @ K.transpose(-2, -1) # [B, H, N, N, N]
+    2. attn_logits = attn_logits / math.sqrt(head_dim)
+    3. attn_logits = attn_logits + bjk # [B, H, N, N, N]
+    4. attn_score = softmax(attn_logits, axis=-1) # [B, H, N, N, N]
+    5. attn_out = attn_score @ V # [B, H, N, N, D]
+
+    Of these, step 3 is not handled by out-of-the-box flash attention.
+
+    Note on nomenclature:
+    - b: batch dimension
+    - h: head dimension
+    - n1: outer sequence dimension (where we tile/aggregate)
+    - n2: inner sequence dimension (where we compute attention)
+    - d: head dimension
+
+    - m: row dim of attn matrix (n2 for Q)
+    - n: col dim of attn matrix (n2 for K/V)
+
+    (n1/n2 is not the same as N!)
+    """
+    # Ensure block size doesn't exceed head dimension
+    tl.static_assert(BLOCK_N <= d, "Block size (BLOCK_N) must not exceed head dimension (d)")
+
+    # Grid dimension explanation:
+    # - program_id(0): Indexes along inner sequence length (N_CTX/BLOCK_M blocks)
+    #      the N along which we aggregate q and k
+    # - program_id(1): Indexes along outer sequence length (N_CTX blocks)
+    # - program_id(2): Indexes along batch*heads dimension (Z*H blocks)
+    start_qn2 = tl.program_id(0) 
+    off_n1 = tl.program_id(1)
+    off_bh = tl.program_id(2)
+
+    # Convert combined batch-head index into separate indices
+    off_b = off_bh // h
+    off_h = off_bh % h
+
+    # Calculate base offset for current batch and head, and also first dim of N
+    # (which is effectively just another dim to batch along for now)
+    # Note that we assume similar strides for Q, K, V, as the original
+    # triton flash attention kernel does.
+    qvk_offset = (
+        off_b.to(tl.int64) * stride_qb +
+        off_h.to(tl.int64) * stride_qh +
+        off_n1.to(tl.int64) * stride_qn1
+    )
+    b_offset = (
+        off_b.to(tl.int64) * stride_bb +
+        off_h.to(tl.int64) * stride_bh
+    )
+
+    # Flash attention 2 slices Q instead of KV slicing, so that the output
+    # is written by one warp/SM--do the same for triangular attention.
+
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset,
+        shape=(n, d),
+        strides=(stride_qn2, stride_qd),
+        offsets=(start_qn2 * BLOCK_M, 0), # Tile Q across blocks
+        block_shape=(BLOCK_M, d),
+        order=(1, 0),
+    )
+    v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
+    V_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(n, d),
+        strides=(stride_vn2, stride_vd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, d),
+        order=v_order,
+    )
+    K_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(d, n),
+        strides=(stride_kd, stride_kn2),
+        offsets=(0, 0),
+        block_shape=(d, BLOCK_N),
+        order=(0, 1),
+    )
+    B_block_ptr = tl.make_block_ptr(
+        base=B + b_offset,
+        shape=(n, n),
+        strides=(stride_bn1, stride_bn2),
+        offsets=(start_qn2 * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_N),
+        order=(1, 0),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        base=Out + qvk_offset,
+        shape=(n, d),
+        strides=(stride_on2, stride_od),
+        offsets=(start_qn2 * BLOCK_M, 0),
+        block_shape=(BLOCK_M, d),
+        order=(1, 0),
+    )
+    # Initialize per-block data structures:
+    offs_qn2 = start_qn2 * BLOCK_M + tl.arange(0, BLOCK_M)  
+    offs_kn2 = tl.arange(0, BLOCK_N)
+
+    # Initialize tracking variables for softmax computation
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max values for stability
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0          # Sum for normalization
+    acc = tl.zeros([BLOCK_M, d], dtype=tl.float32)      # Accumulated attention outputs
+
+    pre_bias_qk_scale = sm_scale # 1/sqrt(head_dim)
+    post_bias_qk_scale = 1.44269504 # 1/log(2), to account for log2 in softmax
+
+    # Load query block - remains in SRAM throughout computation
+    q = tl.load(Q_block_ptr)
+
+    acc, l_i, m_i = _attn_fwd_inner(
+        acc, l_i, m_i, q,
+        K_block_ptr, V_block_ptr, B_block_ptr,
+        start_qn2, pre_bias_qk_scale, post_bias_qk_scale,
+        BLOCK_M, d, BLOCK_N,
+        offs_qn2, offs_kn2,
+        n, V.dtype.element_ty == tl.float8e5
+        )
+
+    # Final processing:
+    # 1. Compute logsumexp values for backward pass
+    m_i += tl.math.log2(l_i)
+    # 2. Normalize softmax by dividing by denominator
+    acc = acc / l_i[:, None]
+    # 3. Store outputs
+    m_ptrs = M + off_bh * n + offs_qn2
+    tl.store(m_ptrs, m_i)
+    tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+
+
+
+configs_tma = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+    for BM in [64, 128]\
+    for BN in [32, 64, 128]\
+    for s in [2, 3, 4, 6]\
+    for w in [4, 8]\
+]
+
+
+
+class _attention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, b, sm_scale):
+        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+        HEAD_DIM_V = v.shape[-1]
+        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
+        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+
+        # Initialize output tensor
+        o = torch.empty_like(q)
+
+        # Initialize scaling factor storage
+        # M is the max val for each query position--QN2.
+        # Shape (B, H, N1, N2), equivalent to attn_scores.max(dim=-1)
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2], q.shape[3]), device=q.device, dtype=torch.float32)
+
+        def grid(args):
+            return (triton.cdiv(q.shape[-2], args["BLOCK_M"]), q.shape[-3], q.shape[0] * q.shape[1])
+
+        ctx.grid = grid
+
+        # Launch regular kernel
+        _attn_fwd[grid](
+            q, k, v, b, sm_scale, M, o,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3), k.stride(4),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3), v.stride(4),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3), o.stride(4),
+            b.stride(0), b.stride(1), b.stride(2), b.stride(3),
+            b=q.shape[0], h=q.shape[1], n=q.shape[2],
+            d=HEAD_DIM_K,)
+
+        # Save tensors needed for backward pass
+        ctx.save_for_backward(q, k, v, o, M)
+        ctx.sm_scale = sm_scale
+        ctx.HEAD_DIM = HEAD_DIM_K
+        return o
+
+attention = _attention.apply
+
+
+@pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 1024, 32)])
+def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
+    """
+    Test function for attention implementation
+    Compares Triton implementation with PyTorch reference implementation
+    """
+    # Set random seed for reproducibility
+    torch.manual_seed(20)
+
+    # Initialize input tensors
+    q = (torch.empty((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    k = (torch.empty((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    v = (torch.empty((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    b = (torch.empty((Z, H, N_CTX, N_CTX), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    sm_scale = 0.5
+    dout = torch.randn_like(q)
+
+    
+    ref_out = reference_tt_attn(q, k, v, b, sm_scale)
+
+    # Compute reference gradients
+    ref_out.backward(dout)
+    ref_dv, v.grad = v.grad.clone(), None
+    ref_dk, k.grad = k.grad.clone(), None
+    ref_dq, q.grad = q.grad.clone(), None
+    ref_db, b.grad = b.grad.clone(), None
+
+    # Triton implementation
+    tri_out = attention(q, k, v, b, sm_scale).half()
+
+    # Compare results--forward pass
+    assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
+
+    backwards_pass_implemented = False
+    if backwards_pass_implemented:
+        tri_out.backward(dout)
+        tri_dv, v.grad = v.grad.clone(), None
+        tri_dk, k.grad = k.grad.clone(), None
+        tri_dq, q.grad = q.grad.clone(), None
+
+        # Verify gradients match
+        assert torch.allclose(ref_dv, tri_dv, atol=1e-2)
+        assert torch.allclose(ref_dk, tri_dk, atol=1e-2)
+        assert torch.allclose(ref_dq, tri_dq, atol=1e-2)
+
+TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
+# BATCH, N_HEADS, HEAD_DIM = 4, 32, 64 # To test on A100
+BATCH, N_HEADS, HEAD_DIM = 4, 8, 32 # To test on L4
+# vary seq length for fixed head and batch=4
+configs = []
+for mode in ["fwd", "bwd"]:
+    if mode == "bwd":
+        continue
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=["N_CTX"],
+            x_vals=[2**i for i in range(4, 10)],
+            line_arg="provider",
+            line_vals=["triton-fp16", "vanilla-torch"],
+            line_names=["Triton [FP16]", "Vanilla PyTorch"],
+            styles=[("red", "-"), ("blue", "-")],
+            ylabel="TFLOPS",
+            plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-tflops",
+            args={
+                "H": N_HEADS,
+                "BATCH": BATCH,
+                "HEAD_DIM": HEAD_DIM,
+                "mode": mode,
+            },
+        ))
+    # Add memory benchmark
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=["N_CTX"],
+            x_vals=[2**i for i in range(4, 10)],
+            line_arg="provider",
+            line_vals=["triton-fp16", "vanilla-torch"],
+            line_names=["Triton [FP16]", "Vanilla PyTorch"],
+            styles=[("red", "-"), ("blue", "-")],
+            ylabel="Memory (GB)",
+            plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-memory",
+            args={
+                "H": N_HEADS,
+                "BATCH": BATCH,
+                "HEAD_DIM": HEAD_DIM,
+                "mode": mode,
+                "metric": "memory",
+            },
+        ))
+
+@triton.testing.perf_report(configs)
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE, metric="tflops"):
+    """
+    Benchmark different attention implementations
+    Compares performance of Triton and Flash Attention implementations
+    """
+    assert mode in ["fwd", "bwd"]
+    dtype = torch.float16
+
+    # Helper function to measure peak memory
+    def get_peak_memory():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+            return torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)  # Convert to GB
+        return 0
+
+    # Reset memory stats
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+
+    q = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((BATCH, H, N_CTX, N_CTX), dtype=dtype, device=device, requires_grad=True)
+    sm_scale = 1.3
+
+    if "triton" in provider:
+        # Handle FP8 case
+        if mode == "fwd" and "fp8" in provider:
+            q = q.to(torch.float8_e5m2)
+            k = k.to(torch.float8_e5m2)
+            v = v.permute(0, 1, 2, 4, 3).contiguous()
+            v = v.permute(0, 1, 2, 4, 3)
+            v = v.to(torch.float8_e5m2)
+            b = b.to(torch.float8_e5m2)
+
+        fn = lambda: attention(q, k, v, b, sm_scale)
+
+        # Setup backward pass if needed
+        if mode == "bwd":
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+
+        ms = triton.testing.do_bench(fn)
+        peak_mem = get_peak_memory()
+
+    elif provider == "vanilla-torch":
+        fn = lambda: reference_tt_attn(q, k, v, b, sm_scale)
+        if mode == "bwd":
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        ms = triton.testing.do_bench(fn)
+        peak_mem = get_peak_memory()
+    else:
+        raise ValueError(f"Invalid provider: {provider}")
+
+    if metric == "memory":
+        return peak_mem
+    else:  # tflops
+        flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
+        total_flops = 2 * flops_per_matmul
+        if mode == "bwd":
+            total_flops *= 2.5  # Additional computations for backward pass
+        return total_flops * 1e-12 / (ms * 1e-3)
+
+def reference_tt_attn(q, k, v, b, sm_scale):
+    """
+    Reference implementation of attention for correctness.
+
+    If a debugging_dict is provided, we will check intermediate values against the debugging_dict.
+    """
+    Z, H, N_CTX = q.shape[:3]
+    # Step 1: QK^T. 
+    qk = torch.matmul(q, k.transpose(-2, -1))
+
+    # Step 2: Scale and add bias--attn scaling happens before bias addition
+    qk_scaled = qk * sm_scale 
+    qk_scaled_bias = qk_scaled + b.view(Z, H, 1, N_CTX, N_CTX)
+
+    # Step 3a: Softmax (builtin)
+    p = torch.softmax(qk_scaled_bias.float(), dim=-1).to(v.dtype)
+
+    # Step 4: Output
+    ref_out = torch.matmul(p, v)
+    return ref_out
+
+if __name__ == "__main__":
+    # Run benchmarks (only works on post-Ampere GPUs)
+    bench_flash_attention.run(save_path=".", print_data=True)
+    test_op(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16)
+    # output_dict = test_attention_intermediate_values()
