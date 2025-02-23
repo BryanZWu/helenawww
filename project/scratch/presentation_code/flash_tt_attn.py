@@ -373,11 +373,13 @@ for mode in ["fwd", "bwd"]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["N_CTX"],
-            x_vals=[2**i for i in range(4, 10)],
+            x_vals=[2**i for i in range(6, 13)],
             line_arg="provider",
-            line_vals=["triton-fp16", "vanilla-torch"],
-            line_names=["Triton [FP16]", "Vanilla PyTorch"],
-            styles=[("red", "-"), ("blue", "-")],
+            line_vals=["triton-fp16", "vanilla-torch"], # "sdpa-kernel"],
+            line_names=["Triton [FP16]", "Vanilla PyTorch"], # "SDPA Kernel"],
+            # line_vals=["triton-fp16", "vanilla-torch", "sdpa-kernel"],
+            # line_names=["Triton [FP16]", "Vanilla PyTorch", "SDPA Kernel"],
+            styles=[("red", "-"), ("blue", "-"), ("green", "-")],
             ylabel="TFLOPS",
             plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-tflops",
             args={
@@ -391,11 +393,13 @@ for mode in ["fwd", "bwd"]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["N_CTX"],
-            x_vals=[2**i for i in range(4, 10)],
+            x_vals=[2**i for i in range(4, 13)],
             line_arg="provider",
-            line_vals=["triton-fp16", "vanilla-torch"],
-            line_names=["Triton [FP16]", "Vanilla PyTorch"],
-            styles=[("red", "-"), ("blue", "-")],
+            line_vals=["triton-fp16", "vanilla-torch"], # "sdpa-kernel"],
+            line_names=["Triton [FP16]", "Vanilla PyTorch"], # "SDPA Kernel"],
+            # line_vals=["triton-fp16", "vanilla-torch", "sdpa-kernel"],
+            # line_names=["Triton [FP16]", "Vanilla PyTorch", "SDPA Kernel"],
+            styles=[("red", "-"), ("blue", "-"), ("green", "-")],
             ylabel="Memory (GB)",
             plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-memory",
             args={
@@ -408,11 +412,7 @@ for mode in ["fwd", "bwd"]:
         ))
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE, metric="tflops"):
-    """
-    Benchmark different attention implementations
-    Compares performance of Triton and Flash Attention implementations
-    """
+def bench_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE, metric="tflops"):
     assert mode in ["fwd", "bwd"]
     dtype = torch.float16
 
@@ -428,52 +428,69 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.empty_cache()
 
-    q = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    k = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    v = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    b = torch.randn((BATCH, H, N_CTX, N_CTX), dtype=dtype, device=device, requires_grad=True)
-    sm_scale = 1.3
+    try:
+        q = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        b = torch.randn((BATCH, H, N_CTX, N_CTX), dtype=dtype, device=device, requires_grad=True)
+        sm_scale = 1.3
 
-    if "triton" in provider:
-        # Handle FP8 case
-        if mode == "fwd" and "fp8" in provider:
-            q = q.to(torch.float8_e5m2)
-            k = k.to(torch.float8_e5m2)
-            v = v.permute(0, 1, 2, 4, 3).contiguous()
-            v = v.permute(0, 1, 2, 4, 3)
-            v = v.to(torch.float8_e5m2)
-            b = b.to(torch.float8_e5m2)
+        if "triton" in provider:
+            # Handle FP8 case
+            if mode == "fwd" and "fp8" in provider:
+                q = q.to(torch.float8_e5m2)
+                k = k.to(torch.float8_e5m2)
+                # v should be contiguous as B, H, D, N instead of B, H, N, D
+                v = v.permute(0, 1, 2, 4, 3).contiguous()
+                v = v.permute(0, 1, 2, 4, 3)
+                v = v.to(torch.float8_e5m2)
+                b = b.to(torch.float8_e5m2)
 
-        fn = lambda: attention(q, k, v, b, sm_scale)
+            fn = lambda: attention(q, k, v, b, sm_scale)
 
-        # Setup backward pass if needed
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
+            # Setup backward pass if needed
+            if mode == "bwd":
+                o = fn()
+                do = torch.randn_like(o)
+                fn = lambda: o.backward(do, retain_graph=True)
 
-        ms = triton.testing.do_bench(fn)
-        peak_mem = get_peak_memory()
+            ms = triton.testing.do_bench(fn)
+            peak_mem = get_peak_memory()
 
-    elif provider == "vanilla-torch":
-        fn = lambda: reference_tt_attn(q, k, v, b, sm_scale)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn)
-        peak_mem = get_peak_memory()
-    else:
-        raise ValueError(f"Invalid provider: {provider}")
+        elif provider == "vanilla-torch":
+            fn = lambda: reference_tt_attn(q, k, v, b, sm_scale)
+            if mode == "bwd":
+                o = fn()
+                do = torch.randn_like(o)
+                fn = lambda: o.backward(do, retain_graph=True)
+            ms = triton.testing.do_bench(fn)
+            peak_mem = get_peak_memory()
+        elif provider == "sdpa-kernel":
+            # Disabled for now--kernel not available on the L4 I'm testing this on
+            def fn():
+                # Memory efficient SDPA kernel
+                with torch.backends.cuda.sdp_kernel(enable_math=False, enable_flash=False, enable_mem_efficient=True):
+                    return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=b)
+            ms = triton.testing.do_bench(fn)
+            peak_mem = get_peak_memory()
+        else:
+            raise ValueError(f"Invalid provider: {provider}")
 
-    if metric == "memory":
-        return peak_mem
-    else:  # tflops
-        flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
-        total_flops = 2 * flops_per_matmul
-        if mode == "bwd":
-            total_flops *= 2.5  # Additional computations for backward pass
-        return total_flops * 1e-12 / (ms * 1e-3)
+        if metric == "memory":
+            return peak_mem
+        else:  # tflops
+            flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
+            total_flops = 2 * flops_per_matmul
+            if mode == "bwd":
+                total_flops *= 2.5  # Additional computations for backward pass
+            return total_flops * 1e-12 / (ms * 1e-3)
+
+    except torch.cuda.OutOfMemoryError:
+        # If we hit OOM, return None for vanilla PyTorch but continue for Triton
+        if metric == "memory":
+            return float('inf')  # Indicate OOM in memory benchmark
+        else:
+            return float('nan')  # Indicate OOM in FLOPS benchmark
 
 def reference_tt_attn(q, k, v, b, sm_scale):
     """
@@ -498,6 +515,6 @@ def reference_tt_attn(q, k, v, b, sm_scale):
 
 if __name__ == "__main__":
     # Run benchmarks (only works on post-Ampere GPUs)
-    bench_flash_attention.run(save_path=".", print_data=True)
+    bench_attention.run(save_path=".", print_data=True)
     test_op(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16)
     # output_dict = test_attention_intermediate_values()
