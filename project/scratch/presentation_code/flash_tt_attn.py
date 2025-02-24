@@ -519,7 +519,8 @@ def reference_tt_attn(q, k, v, b, sm_scale):
     return ref_out
 
 if __name__ == "__main__":
-    # Run benchmarks (only works on post-Ampere GPUs)
-    bench_attention.run(save_path=".", print_data=True)
+    # Run basic correctness test
     test_op(Z=2, H=4, L=128, HEAD_DIM=32, dtype=torch.float16)
-    # output_dict = test_attention_intermediate_values()
+
+    # Run benchmarks
+    bench_attention.run(save_path=".", print_data=True)
