@@ -10,6 +10,20 @@ Modifications:
   but also modulated by the information bjk derived from
   the third edge jk of this triangle"
 - Triangle attention input is pw for all QKV: (B, H, N, N, D)
+
+Notes on nomenclature:
+- Shapes:
+    - B: batch
+    - H: heads
+    - L: context length
+    - D: dimensions
+Tensors:
+    - Q: (B, H, QL1, QL2, D) Query
+    - K: (B, H, KN1, KL2, D) Key
+    - V: (B, H, KN1, KL2, D) Value
+    - B_pw: (B, H, KN1, KL2) PW Bias
+    - M: (B, H, QL1, QL2) Max values
+    - O: (B, H, QL1, QL2, D) Output
 '''
 
 import pytest
@@ -34,10 +48,10 @@ print("TMA benchmarks will be running without grid constant TMA descriptor.")
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
-                    K_block_ptr, V_block_ptr, B_block_ptr, #
-                    start_qn2, pre_bias_qk_scale, post_bias_qk_scale, #
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
-                    offs_qn2: tl.constexpr, offs_kn2: tl.constexpr,  #
+                    K_block_ptr, V_block_ptr, B_pw_block_ptr, #
+                    start_ql2, pre_bias_qk_scale, post_bias_qk_scale, #
+                    BLOCK_QL2: tl.constexpr, H: tl.constexpr, BLOCK_KL2: tl.constexpr,  #
+                    offs_ql2: tl.constexpr, offs_kl2: tl.constexpr,  #
                     N_CTX: tl.constexpr, fp8_v: tl.constexpr):
     """
     Inner kernel for attention forward pass computation
@@ -48,11 +62,11 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     # Advance block pointers to correct starting positions
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
-    B_block_ptr = tl.advance(B_block_ptr, (0, lo))
+    B_pw_block_ptr = tl.advance(B_pw_block_ptr, (0, lo))
 
     # Loop over the entire sequence of KV, accumulating (Q @ K)V
-    for start_n in range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
+    for start_n in range(lo, hi, BLOCK_KL2):
+        start_n = tl.multiple_of(start_n, BLOCK_KL2)
 
         # Load and print K block shape
         k = tl.load(K_block_ptr)
@@ -60,8 +74,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         qk = tl.dot(q, k)
 
         # Apply attention bias, and scaling (pre-bias being 1/sqrt(head_dim) and post-bias being 1/log(2))
-        b = tl.load(B_block_ptr)
-        qk = (qk * pre_bias_qk_scale + b) * post_bias_qk_scale
+        b_pw = tl.load(B_pw_block_ptr)
+        qk = (qk * pre_bias_qk_scale + b_pw) * post_bias_qk_scale
 
         # Update new max value if needed. Subtract for stability
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -88,48 +102,49 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         m_i = m_ij
 
         # Advance block pointers
-        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        B_block_ptr = tl.advance(B_block_ptr, (0, BLOCK_N))
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_KL2, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_KL2))
+        B_pw_block_ptr = tl.advance(B_pw_block_ptr, (0, BLOCK_KL2))
 
     return acc, l_i, m_i
 
 configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
-    for BM in [64, 128]\
-    for BN in [32, 64]\
+    triton.Config({'BLOCK_QL2': B_QL2, 'BLOCK_KL2': B_KL2}, num_stages=s, num_warps=w) \
+    for B_QL2 in [64, 128]\
+    for B_KL2 in [32, 64]\
     for s in ([1] if is_hip() else [3, 4, 7])\
     for w in [4, 8]\
 ]
 
 
 def keep(conf):
-    BLOCK_M = conf.kwargs["BLOCK_M"]
-    BLOCK_N = conf.kwargs["BLOCK_N"]
-    if BLOCK_M * BLOCK_N < 128 * 128 and conf.num_warps == 8:
+    BLOCK_QL2 = conf.kwargs["BLOCK_QL2"]
+    BLOCK_KL2 = conf.kwargs["BLOCK_KL2"]
+    if BLOCK_QL2 * BLOCK_KL2 < 128 * 128 and conf.num_warps == 8:
         return False
     return True
 
 
 @triton.autotune(list(filter(keep, configs)), key=["n", "d"])
 @triton.jit
-def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for softmax, M: max values, Out: output tensor
-              stride_qb, stride_qh, stride_qn1, stride_qn2, stride_qd,  # Strides for Q tensor: batch, head, seq_len, seq_len, head_dim
-              stride_kb, stride_kh, stride_kn1, stride_kn2, stride_kd,  # Strides for K tensor
-              stride_vb, stride_vh, stride_vn1, stride_vn2, stride_vd,  # Strides for V tensor
-              stride_ob, stride_oh, stride_on1, stride_on2, stride_od,  # Strides for Output tensor
-              stride_bb, stride_bh, stride_bn1, stride_bn2,  # Strides for B tensor
-              b, h, n,  # b=batch_size, h=num_heads, n=sequence_length
-              d: tl.constexpr,  # Size of each attention head
-              BLOCK_M: tl.constexpr,  # Block size for sequence dimension
-              BLOCK_N: tl.constexpr,  # Block size for attention computation
+def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for softmax, M: max values, Out: output tensor
+              stride_qb, stride_qh, stride_ql1, stride_ql2, stride_qd,  # Strides for Q tensor: batch, head, seq_len, seq_len, head_dim
+              stride_kb, stride_kh, stride_kl1, stride_kl2, stride_kd,  # Strides for K tensor
+              stride_vb, stride_vh, stride_vl1, stride_vl2, stride_vd,  # Strides for V tensor
+              stride_ob, stride_oh, stride_ol1, stride_ol2, stride_od,  # Strides for Output tensor
+              stride_bb, stride_bh, stride_bl1, stride_bl2,  # Strides for B tensor
+              B, H, L,  # b=batch_size, h=num_heads, n=sequence_length
+              D: tl.constexpr,  # Size of each attention head
+              BLOCK_QL2: tl.constexpr,  # Block size for sequence dimension
+              BLOCK_KL2: tl.constexpr,  # Block size for attention computation
               ):
     """
     Attention forward pass kernel: 
-    Q: [b, h, n, n, d]
-    K: [b, h, n, n, d]
-    V: [b, h, n, n, d]
-    B: [b, h, n, n]
+    Q: [B, H, N1, QL2, D]
+    K: [B, H, N1, KL2, D]
+    V: [B, H, N1, KL2, D]
+    B: [B, H, QL2, KL2]
+    (Note: in practice all N is equal since we work with a pw representation)
 
 
     Naive implementation:
@@ -140,34 +155,22 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
     5. attn_out = attn_score @ V # [B, H, N, N, D]
 
     Of these, step 3 is not handled by out-of-the-box flash attention.
-
-    Note on nomenclature:
-    - b: batch dimension
-    - h: head dimension
-    - n1: outer sequence dimension (where we tile/aggregate)
-    - n2: inner sequence dimension (where we compute attention)
-    - d: head dimension
-
-    - m: row dim of attn matrix (n2 for Q)
-    - n: col dim of attn matrix (n2 for K/V)
-
-    (n1/n2 is not the same as N!)
     """
     # Ensure block size doesn't exceed head dimension
-    tl.static_assert(BLOCK_N <= d, "Block size (BLOCK_N) must not exceed head dimension (d)")
+    tl.static_assert(BLOCK_KL2 <= D, "Block size (BLOCK_KL2) must not exceed head dimension (D)")
 
     # Grid dimension explanation:
-    # - program_id(0): Indexes along inner sequence length (N_CTX/BLOCK_M blocks)
+    # - program_id(0): Indexes along inner sequence length (N_CTX/BLOCK_QL2 blocks)
     #      the N along which we aggregate q and k
     # - program_id(1): Indexes along outer sequence length (N_CTX blocks)
     # - program_id(2): Indexes along batch*heads dimension (Z*H blocks)
-    start_qn2 = tl.program_id(0) 
-    off_n1 = tl.program_id(1)
+    start_ql2 = tl.program_id(0) 
+    off_l1 = tl.program_id(1)
     off_bh = tl.program_id(2)
 
     # Convert combined batch-head index into separate indices
-    off_b = off_bh // h
-    off_h = off_bh % h
+    off_b = off_bh // H
+    off_h = off_bh % H
 
     # Calculate base offset for current batch and head, and also first dim of N
     # (which is effectively just another dim to batch along for now)
@@ -176,7 +179,7 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
     qvk_offset = (
         off_b.to(tl.int64) * stride_qb +
         off_h.to(tl.int64) * stride_qh +
-        off_n1.to(tl.int64) * stride_qn1
+        off_l1.to(tl.int64) * stride_ql1
     )
     b_offset = (
         off_b.to(tl.int64) * stride_bb +
@@ -188,53 +191,53 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
 
     Q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset,
-        shape=(n, d),
-        strides=(stride_qn2, stride_qd),
-        offsets=(start_qn2 * BLOCK_M, 0), # Tile Q across blocks
-        block_shape=(BLOCK_M, d),
+        shape=(L, D),
+        strides=(stride_ql2, stride_qd),
+        offsets=(start_ql2 * BLOCK_QL2, 0), # Tile Q across blocks
+        block_shape=(BLOCK_QL2, D),
         order=(1, 0),
     )
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
     V_block_ptr = tl.make_block_ptr(
         base=V + qvk_offset,
-        shape=(n, d),
-        strides=(stride_vn2, stride_vd),
+        shape=(L, D),
+        strides=(stride_vl2, stride_vd),
         offsets=(0, 0),
-        block_shape=(BLOCK_N, d),
+        block_shape=(BLOCK_KL2, D),
         order=v_order,
     )
     K_block_ptr = tl.make_block_ptr(
         base=K + qvk_offset,
-        shape=(d, n),
-        strides=(stride_kd, stride_kn2),
+        shape=(D, L),
+        strides=(stride_kd, stride_kl2),
         offsets=(0, 0),
-        block_shape=(d, BLOCK_N),
+        block_shape=(D, BLOCK_KL2),
         order=(0, 1),
     )
-    B_block_ptr = tl.make_block_ptr(
-        base=B + b_offset,
-        shape=(n, n),
-        strides=(stride_bn1, stride_bn2),
-        offsets=(start_qn2 * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_N),
+    B_pw_block_ptr = tl.make_block_ptr(
+        base=B_pw + b_offset,
+        shape=(L, L),
+        strides=(stride_bl1, stride_bl2),
+        offsets=(start_ql2 * BLOCK_QL2, 0),
+        block_shape=(BLOCK_QL2, BLOCK_KL2),
         order=(1, 0),
     )
     O_block_ptr = tl.make_block_ptr(
         base=Out + qvk_offset,
-        shape=(n, d),
-        strides=(stride_on2, stride_od),
-        offsets=(start_qn2 * BLOCK_M, 0),
-        block_shape=(BLOCK_M, d),
+        shape=(L, D),
+        strides=(stride_ol2, stride_od),
+        offsets=(start_ql2 * BLOCK_QL2, 0),
+        block_shape=(BLOCK_QL2, D),
         order=(1, 0),
     )
     # Initialize per-block data structures:
-    offs_qn2 = start_qn2 * BLOCK_M + tl.arange(0, BLOCK_M)  
-    offs_kn2 = tl.arange(0, BLOCK_N)
+    offs_ql2 = start_ql2 * BLOCK_QL2 + tl.arange(0, BLOCK_QL2)  
+    offs_kl2 = tl.arange(0, BLOCK_KL2)
 
     # Initialize tracking variables for softmax computation
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max values for stability
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0          # Sum for normalization
-    acc = tl.zeros([BLOCK_M, d], dtype=tl.float32)      # Accumulated attention outputs
+    m_i = tl.zeros([BLOCK_QL2], dtype=tl.float32) - float("inf")  # Max values for stability
+    l_i = tl.zeros([BLOCK_QL2], dtype=tl.float32) + 1.0          # Sum for normalization
+    acc = tl.zeros([BLOCK_QL2, D], dtype=tl.float32)      # Accumulated attention outputs
 
     pre_bias_qk_scale = sm_scale # 1/sqrt(head_dim)
     post_bias_qk_scale = 1.44269504 # 1/log(2), to account for log2 in softmax
@@ -244,11 +247,11 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
 
     acc, l_i, m_i = _attn_fwd_inner(
         acc, l_i, m_i, q,
-        K_block_ptr, V_block_ptr, B_block_ptr,
-        start_qn2, pre_bias_qk_scale, post_bias_qk_scale,
-        BLOCK_M, d, BLOCK_N,
-        offs_qn2, offs_kn2,
-        n, V.dtype.element_ty == tl.float8e5
+        K_block_ptr, V_block_ptr, B_pw_block_ptr,
+        start_ql2, pre_bias_qk_scale, post_bias_qk_scale,
+        BLOCK_QL2, D, BLOCK_KL2,
+        offs_ql2, offs_kl2,
+        L, V.dtype.element_ty == tl.float8e5
         )
 
     # Final processing:
@@ -257,14 +260,14 @@ def _attn_fwd(Q, K, V, B, sm_scale, M, Out,  # sm_scale: scaling factor for soft
     # 2. Normalize softmax by dividing by denominator
     acc = acc / l_i[:, None]
     # 3. Store outputs
-    m_ptrs = M + off_bh * n + offs_qn2
+    m_ptrs = M + off_bh * L + offs_ql2
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
 
 
 configs_tma = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+    triton.Config({'BLOCK_QL2': BM, 'BLOCK_KL2': BN}, num_stages=s, num_warps=w) \
     for BM in [64, 128]\
     for BN in [32, 64, 128]\
     for s in [2, 3, 4, 6]\
@@ -285,12 +288,12 @@ class _attention(torch.autograd.Function):
         o = torch.empty_like(q)
 
         # Initialize scaling factor storage
-        # M is the max val for each query position--QN2.
-        # Shape (B, H, N1, N2), equivalent to attn_scores.max(dim=-1)
+        # M is the max val for each query position--QL2.
+        # Shape (B, H, N1, L2), equivalent to attn_scores.max(dim=-1)
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2], q.shape[3]), device=q.device, dtype=torch.float32)
 
         def grid(args):
-            return (triton.cdiv(q.shape[-2], args["BLOCK_M"]), q.shape[-3], q.shape[0] * q.shape[1])
+            return (triton.cdiv(q.shape[-2], args["BLOCK_QL2"]), q.shape[-3], q.shape[0] * q.shape[1])
 
         ctx.grid = grid
 
