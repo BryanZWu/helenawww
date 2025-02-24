@@ -161,7 +161,7 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
 
     # Grid dimension explanation:
     # - program_id(0): Indexes along inner sequence length (L/BLOCK_QL2 blocks)
-    #      the N along which we aggregate q and k
+    #      the L along which we aggregate q and k
     # - program_id(1): Indexes along outer sequence length (L blocks)
     # - program_id(2): Indexes along batch*heads dimension (Z*H blocks)
     start_ql2 = tl.program_id(0) 
@@ -442,7 +442,7 @@ def bench_attention(B, H, L, D, mode, provider, device=DEVICE, metric="tflops"):
             if mode == "fwd" and "fp8" in provider:
                 q = q.to(torch.float8_e5m2)
                 k = k.to(torch.float8_e5m2)
-                # v should be contiguous as B, H, D, N instead of B, H, N, D
+                # v should be contiguous as B, H, D, L instead of B, H, L, D
                 v = v.permute(0, 1, 2, 4, 3).contiguous()
                 v = v.permute(0, 1, 2, 4, 3)
                 v = v.to(torch.float8_e5m2)
