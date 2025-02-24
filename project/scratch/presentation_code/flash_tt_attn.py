@@ -47,11 +47,11 @@ print("TMA benchmarks will be running without grid constant TMA descriptor.")
 
 
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i, q,  #
-                    K_block_ptr, V_block_ptr, B_pw_block_ptr, #
-                    start_ql2, pre_bias_qk_scale, post_bias_qk_scale, #
+def _attn_fwd_inner(acc, l_i, m_i, q,
+                    K_block_ptr, V_block_ptr, B_pw_block_ptr,
+                    start_ql2, pre_bias_qk_scale, post_bias_qk_scale,
                     BLOCK_QL2: tl.constexpr, H: tl.constexpr, BLOCK_KL2: tl.constexpr,  #
-                    offs_ql2: tl.constexpr, offs_kl2: tl.constexpr,  #
+                    offs_ql2: tl.constexpr, offs_kl2: tl.constexpr,
                     L: tl.constexpr, fp8_v: tl.constexpr):
     """
     Inner kernel for attention forward pass computation
