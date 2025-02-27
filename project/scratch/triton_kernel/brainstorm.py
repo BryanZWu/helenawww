@@ -22,36 +22,140 @@ def reference_tt_attn(q, k, v, b, sm_scale):
     ref_out = torch.matmul(p, v)
     return ref_out
 
-def reference_attn(q, k, v, sm_scale):
-    """
-    Reference implementation of general attention for correctness.
-    """
-    attn_matrix = torch.matmul(q, k.transpose(-2, -1))
-    attn_matrix = torch.softmax(attn_matrix * sm_scale, dim=-1)
-    out = torch.matmul(attn_matrix, v)
-    return out
-
-def manual_attention_gradients(d_out, q, k, v, p, sm_scale):
+def manual_attention_gradients(d_out, Q, K, V, P, sm_scale):
     """
     Manual implementation of attention gradients.
     """
-    B, H, L, D = q.shape
-    assert q.shape == k.shape == v.shape
+    B, H, L, D = Q.shape
+    assert Q.shape == K.shape == V.shape
     assert d_out.shape == (B, H, L, D)
-    assert p.shape == (B, H, L, L)
-    dV = torch.matmul(p.transpose(-2, -1), d_out)
+    assert P.shape == (B, H, L, L)
+    dV = P.mT @ d_out
     assert dV.shape == (B, H, L, D)
-    dP = torch.matmul(d_out, v.transpose(-2, -1))
+    dP = d_out @ V.mT
     assert dP.shape == (B, H, L, L)
-    def d_softmax(p, dP):
-        return dP * p * (1 - p)
-    d_attn = d_softmax(p, dP)
-    assert d_attn.shape == (B, H, L, L)
-    dQ = torch.matmul(d_attn, k)
+    def d_softmax(P, dP):
+        dA = torch.zeros_like(dP)
+        # da = p(I-p.T)dP
+        for j in range(L):
+            p = P[:, :, j]
+            diag_p = torch.diag_embed(p)
+            assert diag_p.shape == (B, H, L, L)
+            p_outer_p = p[:, :, None, :] * p[:, :, :, None]
+            assert p_outer_p.shape == (B, H, L, L)
+            dA[:, :, j, :] = ((diag_p - p_outer_p) @ dP[:, :, j, :, None]).squeeze(-1)
+        return dA
+    d_scaled_A = d_softmax(P, dP)
+    dA = d_scaled_A * sm_scale
+    assert dA.shape == (B, H, L, L)
+    dQ = dA @ K
     assert dQ.shape == (B, H, L, D)
-    dK = torch.matmul(d_attn.transpose(-2, -1), q)
+    dK = dA.mT @ Q
     assert dK.shape == (B, H, L, D)
-    return dQ, dK, dV
+    return dQ, dK, dV, dP, dA
 
 def test_manual_attention_gradients():
+    B, H, L, D = 2, 4, 8, 16
+    Q = torch.randn(B, H, L, D, requires_grad=True)
+    K = torch.randn(B, H, L, D, requires_grad=True)
+    V = torch.randn(B, H, L, D, requires_grad=True)
+    sm_scale = D ** -0.5
+
+    # First, run through vanilla attention
+    A = Q @ K.transpose(-2, -1)
+    A.retain_grad()
+    P = torch.softmax(A * sm_scale, dim=-1)
+    P.retain_grad()
+    out = P @ V
+    out.retain_grad()
+
+    loss = out.sum()
+
+    # Autograd gradients
+    loss.backward()
+    d_out = out.grad
+    dQ_autograd = Q.grad
+    dK_autograd = K.grad
+    dV_autograd = V.grad
+    dP_autograd = P.grad
+    dA_autograd = A.grad
+
+    # Now, run through manual gradients
+    dQ, dK, dV, dP, dA = manual_attention_gradients(d_out, Q, K, V, P, sm_scale)
+    assert torch.allclose(dP, dP_autograd, atol=1e-5)
+    assert torch.allclose(dA, dA_autograd, atol=1e-5)
+    assert torch.allclose(dQ, dQ_autograd, atol=1e-5)
+    assert torch.allclose(dK, dK_autograd, atol=1e-5)
+    assert torch.allclose(dV, dV_autograd, atol=1e-5)
+
+def manual_triangular_attention_gradients(d_out, Q, K, V, P, sm_scale):
+    """
+    Manual implementation of triangular attention gradients.
+    """
+    B, H, L, L, D = Q.shape
+    assert Q.shape == K.shape == V.shape
+    assert d_out.shape == (B, H, L, L, D)
+    assert P.shape == (B, H, L, L, L)
+    dV = P.mT @ d_out
+    assert dV.shape == (B, H, L, L, D)
+    dP = d_out @ V.mT
+    assert dP.shape == (B, H, L, L, L)
+    def d_softmax(P, dP):
+        dA = torch.zeros_like(dP)
+        # da = p(I-p.T)dP
+        for j in range(L):
+            p = P[:, :, :, j]
+            diag_p = torch.diag_embed(p)
+            assert diag_p.shape == (B, H, L, L, L)
+            p_outer_p = p[:, :, :, :, None] * p[:, :, :, None, :]
+            assert p_outer_p.shape == (B, H, L, L, L)
+            dA[:, :, :, j, :] = ((diag_p - p_outer_p) @ dP[:, :, :, j, :, None]).squeeze(-1)
+        return dA
+    d_scaled_A = d_softmax(P, dP)
+    dA = d_scaled_A * sm_scale
+    assert dA.shape == (B, H, L, L, L)
+    dQ = dA @ K
+    assert dQ.shape == (B, H, L, L, D)
+    dK = dA.mT @ Q
+    assert dK.shape == (B, H, L, L, D)
+    return dQ, dK, dV, dP, dA
+
+def test_manual_triangular_attention_gradients():
+    B, H, L, D = 2, 4, 8, 16
+    Q = torch.randn(B, H, L, L, D, requires_grad=True)
+    K = torch.randn(B, H, L, L, D, requires_grad=True)
+    V = torch.randn(B, H, L, L, D, requires_grad=True)
+    sm_scale = D ** -0.5
+
+    # First, run through vanilla attention
+    A = Q @ K.mT
+    A.retain_grad()
+    P = torch.softmax(A * sm_scale, dim=-1)
+    P.retain_grad()
+    out = P @ V
+    out.retain_grad()
+
+    loss = out.sum()
+
+    # Autograd gradients
+    loss.backward()
+    d_out = out.grad
+    dQ_autograd = Q.grad
+    dK_autograd = K.grad
+    dV_autograd = V.grad
+    dP_autograd = P.grad
+    dA_autograd = A.grad
+
+    # Now, run through manual gradients
+    dQ, dK, dV, dP, dA = manual_triangular_attention_gradients(d_out, Q, K, V, P, sm_scale)
+    assert torch.allclose(dP, dP_autograd, atol=1e-5)
+    assert torch.allclose(dA, dA_autograd, atol=1e-5)
+    assert torch.allclose(dQ, dQ_autograd, atol=1e-5)
+    assert torch.allclose(dK, dK_autograd, atol=1e-5)
+    assert torch.allclose(dV, dV_autograd, atol=1e-5)
+
+if __name__ == "__main__":
+    test_manual_attention_gradients()
+    test_manual_triangular_attention_gradients()
+    
     
