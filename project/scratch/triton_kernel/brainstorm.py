@@ -102,7 +102,7 @@ def manual_triangular_attention_gradients(d_out, Q, K, V, B_pw, P, sm_scale):
     assert dP.shape == (B, H, L, L, L)
     def d_softmax(P, dP):
         dA = torch.zeros_like(dP)
-        # da = p(I-p.T)dP
+        # da = (diag(p) - p.T) @ dP
         for j in range(L):
             p = P[:, :, :, j]
             diag_p = torch.diag_embed(p)
@@ -158,6 +158,62 @@ def test_manual_triangular_attention_gradients():
     assert torch.allclose(dK, dK_autograd, atol=1e-5)
     assert torch.allclose(dV, dV_autograd, atol=1e-5)
     assert torch.allclose(dB_pw, dB_pw_autograd, atol=1e-5)
+
+def manual_tile_backward(d_out, Q, K, V, B_pw, O, sm_scale, L, BLOCK_QL2=64, BLOCK_KL2=64):
+    """
+    Manual implementation of tile backward.
+    Note that we don't use P and instead rematerialize it to 
+    avoid global memory access.
+
+    In practice the backward pass is _two_ separate kernels.
+    """
+    B, H, QL1, QL2, D = Q.shape
+    B, H, KL1, KL2, D = K.shape
+    # Kernel 1: preprocessing to compute elementwise multiple of 
+    # O and d_out. This is a no-op from the other kernel for now
+    D = (O * d_out).sum(dim=-1)
+    assert D.shape == (B, H, QL1, QL2)
+
+    BLOCK_QL2 = 32
+    BLOCK_KL2 = 32
+
+    dK = torch.zeros_like(K)
+    dV = torch.zeros_like(V)
+    dQ = torch.zeros_like(Q)
+    dB_pw = torch.zeros_like(B_pw)
+
+    # Kernel 2: Here we want to tile as needed
+    # First 3 for loops are handeld by program id tiling
+    for b in range(B):
+        for h in range(H):
+            for l1 in range(0, QL1):
+                for n in range(0, KL2, BLOCK_KL2):
+                    dv_n = torch.zeros((BLOCK_KL2, D))
+                    dk_n = torch.zeros((BLOCK_KL2, D))
+                    for m in range(0, QL1, BLOCK_QL2):
+                        # Rematerialize A and P
+                        q = Q[b, h, l1, m:m+BLOCK_QL2]
+                        k = K[b, h, l1, n:n+BLOCK_KL2]
+                        v = V[b, h, l1, n:n+BLOCK_KL2]
+                        l = L[b, h, l1]
+                        assert l.shape == (B, H, QL1, QL2)
+                        a_prenorm_prebias = q @ k.mT
+                        a_prebias = a_prenorm_prebias * sm_scale
+                        a = a_prebias + B_pw[b, h, l1, m:m+BLOCK_QL2, n:n+BLOCK_KL2]
+                        # L is the logsumexp denominator
+                        p = torch.exp(a - l)
+                        d_out_tile = d_out[b, h, l1, n:n+BLOCK_KL2, m:m+BLOCK_QL2]
+                        dv = p @ d_out_tile
+                        dp = d_out_tile @ V[b, h, m:m+BLOCK_QL2, n:n+BLOCK_KL2].mT
+                        # Inverse softmax
+                        da = p * (dp - D[b, h, l1, m:m+BLOCK_QL2])
+                        dQ[b, h, l1, m:m+BLOCK_QL2] += da @ k.mT # transpose here?
+                        dk = da.mT @ q # transpose here?
+                        dv_n += dv
+                        dk_n += dk
+                    dV[b, h, l1, n:n+BLOCK_KL2] = dv_n
+                    dK[b, h, l1, n:n+BLOCK_KL2] = dk_n
+    return dQ, dK, dV, dB_pw
 
 if __name__ == "__main__":
     test_manual_attention_gradients()
