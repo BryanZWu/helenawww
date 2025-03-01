@@ -62,19 +62,19 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
-        if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
-            tl.device_print("Processing block start_n:", start_n)
+        # if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+        #     tl.device_print("Processing block start_n:", start_n)
 
         # Load and print K block shape
         k = tl.load(K_block_ptr)
-        if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
-            tl.device_print("k shape:", k.shape[0], k.shape[1])
+        # if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+        #     tl.device_print("k shape:", k.shape[0], k.shape[1])
 
         qk = tl.dot(q, k)
 
         # Print QK shape and some values
-        if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
-            tl.device_print("qk shape:", qk.shape[0], qk.shape[1])
+        # if ((tl.program_id(0) == 0) and (tl.program_id(1) == 0)) and (tl.program_id(2) == 0):
+        #     tl.device_print("qk shape:", qk.shape[0], qk.shape[1])
             # tl.device_print("qk[0,0]:", qk[0,0])
 
         # Apply attention bias, and scaling (pre-bias being 1/sqrt(head_dim) and post-bias being 1/log(2))
@@ -398,7 +398,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
     dout = torch.randn_like(q)
 
     # Reference implementation using PyTorch
-    b = torch.ones((Z, H, N_CTX, N_CTX), device=DEVICE)
+    b = torch.randn((Z, H, N_CTX, N_CTX), device=DEVICE)
     p = torch.matmul(q, k.transpose(3, 4)) * sm_scale  # Compute attention scores
     p = p + b.view(Z, H, 1, N_CTX, N_CTX)
     p = torch.softmax(p.float(), dim=-1).half()  # Apply softmax
@@ -414,8 +414,10 @@ def test_op(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
     tri_out = attention(q, k, v, b, sm_scale).half()
 
     # Compare results--forward pass
-    breakpoint()
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
+
+    ref_out_fn_out = reference_tt_attn(q, k, v, b, sm_scale)["ref_out"]
+    assert torch.allclose(ref_out.float(), ref_out_fn_out.float(), atol=1e-2, rtol=0)
 
     backwards_pass_implemented = False
     if backwards_pass_implemented:
@@ -538,6 +540,7 @@ def reference_tt_attn(q, k, v, b, sm_scale, debugging_dict=None):
 
     If a debugging_dict is provided, we will check intermediate values against the debugging_dict.
     """
+    q, k, v, b = q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), b.to(torch.float32)
     Z, H, N_CTX = q.shape[:3]
     # Step 1: QK^T. 
     qk = torch.matmul(q, k.transpose(-2, -1))
@@ -579,7 +582,7 @@ def reference_tt_attn(q, k, v, b, sm_scale, debugging_dict=None):
 
 
     # Step 3a: Softmax (builtin)
-    p_ref = torch.softmax(qk_scaled_bias.float(), dim=-1)
+    p_ref = torch.softmax(qk_scaled_bias.float(), dim=-1).to(qk_scaled_bias.dtype)
     # Step 3b: Manual softmax 
     m_i = torch.max(qk_scaled_bias, dim=-1)[0]
     qk_scaled_bias_minus_max = qk_scaled_bias - m_i.unsqueeze(-1)
@@ -773,6 +776,8 @@ def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, BLOCK_N
         dtype: Data type for tensors
     """
     torch.manual_seed(20)
+    torch.cuda.manual_seed(20)
+    dtype = torch.float32
 
     # Initialize input tensors
     q = torch.randn((Z, H, N_CTX, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
@@ -788,6 +793,7 @@ def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, BLOCK_N
 
     print("\nComputing CPU default implementation...")
     gt_out_dict = reference_tt_attn(q, k, v, b, sm_scale, debugging_dict=debugging_dict)
+    breakpoint()
     assert torch.allclose(tiled_out, gt_out_dict["ref_out"], atol=1e-2, rtol=0)
     return gt_out_dict
 

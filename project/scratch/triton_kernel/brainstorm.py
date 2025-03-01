@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 INV_LOG2 = 1 / math.log(2)
+device = "cuda"
 
 # First, non-triangular attention to test my understanding
 def manual_attention_gradients(d_out, Q, K, V, P, sm_scale):
@@ -78,6 +79,7 @@ def reference_tt_attn(q, k, v, b, sm_scale):
 
     If a debugging_dict is provided, we will check intermediate values against the debugging_dict.
     """
+    q, k, v, b = q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), b.to(torch.float32)
     Z, H, L = q.shape[:3]
     # Step 1: QK^T. 
     qk = torch.matmul(q, k.transpose(-2, -1))
@@ -157,10 +159,10 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                         q_block = q[z, h, n1, start_m:end_m, :]  # [BLOCK_M, D]
                         k_block = k[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
                         v_block = v[z, h, n1, start_n:end_n, :]  # [BLOCK_N, D]
-                        b_block = b[z, h, n1, start_n:end_n]  # [BLOCK_N]
+                        b_block = b[z, h, start_m:end_m, start_n:end_n]  # [BLOCK_M, BLOCK_N]
 
                         # Compute attention scores for this block
-                        qk = torch.matmul(q_block, k_block.transpose(-2, -1))  # [N_CTX, BLOCK_N]
+                        qk = torch.matmul(q_block, k_block.transpose(-2, -1))  # [BLOCK_M, BLOCK_N]
                         qk_scaled = qk * sm_scale 
                         qk_scaled_bias = qk_scaled + b_block
                         qk_scaled_bias_with_log2 = qk_scaled_bias * 1.44269504 # 1.44269504 = 1/log(2)
@@ -290,8 +292,8 @@ def manual_tile_backward(d_out, Q, K, V, B_pw, O, sm_scale, logsumexp_agg, BLOCK
         for h in range(H):
             for l1 in range(0, QL1):
                 for n in range(0, KL2, BLOCK_KL2):
-                    dv_n = torch.zeros((BLOCK_KL2, D))
-                    dk_n = torch.zeros((BLOCK_KL2, D))
+                    dv_n = torch.zeros((BLOCK_KL2, D), device=device)
+                    dk_n = torch.zeros((BLOCK_KL2, D), device=device)
                     k = K[b, h, l1, n:n+BLOCK_KL2]
                     v = V[b, h, l1, n:n+BLOCK_KL2]
                     for m in range(0, QL1, BLOCK_QL2):
@@ -326,11 +328,15 @@ def test_manual_tile_backward():
     # Forward pass and backward pass, followed by forward tiled pass 
     # and backward tiled pass.
     # Then, check that the tiled backward pass matches the manual one.
-    B, H, L, D = 2, 4, 128, 64
-    Q = torch.randn(B, H, L, L, D, requires_grad=True)
-    K = torch.randn(B, H, L, L, D, requires_grad=True)
-    V = torch.randn(B, H, L, L, D, requires_grad=True)
-    B_pw = torch.randn(B, H, L, L, requires_grad=True)
+    torch.manual_seed(20)
+    torch.cuda.manual_seed(20)
+
+    B, H, L, D = 2, 4, 128, 32
+    Q = torch.randn(B, H, L, L, D, requires_grad=True, device=device)
+    K = torch.randn(B, H, L, L, D, requires_grad=True, device=device)
+    V = torch.randn(B, H, L, L, D, requires_grad=True, device=device)
+    # B_pw = torch.ones((B, H, L, L), requires_grad=True, device=device)
+    B_pw = torch.randn(B, H, L, L, requires_grad=True, device=device)
     sm_scale = D ** -0.5
 
     # Torch autograd forward/backward
@@ -342,9 +348,16 @@ def test_manual_tile_backward():
     dV_autograd = V.grad
     dB_pw_autograd = B_pw.grad
 
+    ### SOME WEIRD STUFF GOING ON: OLD AND NEW NOT MATCHING UP?
+    reference_out = reference_tt_attn(Q, K, V, B_pw, sm_scale)[0]
+    tile_out = reference_tt_tiled(Q, K, V, B_pw, sm_scale)[0]
+    assert torch.allclose(reference_out, tile_out, atol=1e-2, rtol=0)
+    # UPDATE: it was the bias that was wrong! Debugging...
+    # END
+
     # Tiled manual forward pass
     out, logsumexp_agg = reference_tt_tiled(Q, K, V, B_pw, sm_scale)
-    assert torch.allclose(logsumexp_agg, logsumexp_torch, atol=1e-5)
+    assert torch.allclose(logsumexp_agg, logsumexp_torch, atol=1e-5) # TODO need to comment this back in
     assert torch.allclose(out, out_torch, atol=1e-5)
 
     # The grad of sum is just 1
