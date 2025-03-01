@@ -794,5 +794,5 @@ def test_attention_intermediate_values(Z=2, H=4, N_CTX=128, HEAD_DIM=32, BLOCK_N
 if __name__ == "__main__":
     # Run benchmarks (only works on post-Ampere GPUs)
     # bench_flash_attention.run(save_path=".", print_data=True)
-    test_op(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16)
-    # output_dict = test_attention_intermediate_values()
+    # test_op(Z=2, H=4, N_CTX=128, HEAD_DIM=32, dtype=torch.float16)
+    output_dict = test_attention_intermediate_values()

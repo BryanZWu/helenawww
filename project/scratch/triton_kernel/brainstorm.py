@@ -1,5 +1,9 @@
+import math
+import random
 import torch
 import torch.nn.functional as F
+
+INV_LOG2 = 1 / math.log(2)
 
 # First, non-triangular attention to test my understanding
 def manual_attention_gradients(d_out, Q, K, V, P, sm_scale):
@@ -85,17 +89,22 @@ def reference_tt_attn(q, k, v, b, sm_scale):
     # Step 3a: Softmax (builtin)
     p = torch.softmax(qk_scaled_bias.float(), dim=-1).to(v.dtype)
 
-    # Step 4: Output
-    ref_out = torch.matmul(p, v)
-
+    # Step 3b: Do manual softmax and make sure it matches
     # Also need to compute logsumexp, the original (not reduced by max for numerical stability)
     # We return log2sumexp.
     def log2sumexp(x):
+        x = x * INV_LOG2 # 1.44269504 = 1/log(2)
         max_x = x.max(dim=-1, keepdim=True).values
         x = x - max_x
         stable_sum = torch.sum(torch.exp2(x), dim=-1)
         return torch.log2(stable_sum) + max_x.squeeze(-1)
     logsumexp = log2sumexp(qk_scaled_bias)
+    p_manual = torch.exp2(qk_scaled_bias * INV_LOG2 - logsumexp[..., None])
+    assert torch.allclose(p, p_manual, atol=1e-5)
+
+    # Step 4: Output
+    ref_out = torch.matmul(p, v)
+
     return ref_out, logsumexp
 
 # Reference forward and 
@@ -351,5 +360,7 @@ def test_manual_tile_backward():
 if __name__ == "__main__":
     # test_manual_attention_gradients()
     # test_manual_triangular_attention_gradients()
+    torch.manual_seed(0)
+    random.seed(0)
     test_manual_tile_backward()
     
