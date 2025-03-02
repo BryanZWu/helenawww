@@ -46,7 +46,7 @@ def is_hip():
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
-@triton.jit
+# @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,
                     K_block_ptr, V_block_ptr, B_pw_block_ptr,
                     start_ql2, pre_bias_qk_scale, post_bias_qk_scale,
@@ -125,8 +125,8 @@ def keep(conf):
     return True
 
 
-@triton.autotune(list(filter(keep, configs)), key=["L", "D"])
-@triton.jit
+# @triton.autotune(list(filter(keep, configs)), key=["L", "D"])
+# @triton.jit
 def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for softmax, M: max values, Out: output tensor
               stride_qb, stride_qh, stride_ql1, stride_ql2, stride_qd,  # Strides for Q tensor: batch, head, seq_len, seq_len, head_dim
               stride_kb, stride_kh, stride_kl1, stride_kl2, stride_kd,  # Strides for K tensor
@@ -265,7 +265,7 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
 # Preprocess can more or less stay the same
-@triton.jit
+# @triton.jit
 def _attn_bwd_preprocess(O, DO,  #
                          O_DO,  #
                          B, H, L,  #
@@ -291,10 +291,11 @@ def _attn_bwd_preprocess(O, DO,  #
 
 @triton.jit
 def _attn_bwd_dkdv(dk, dv,  #
-                   Q, k, v, sm_scale,  #
+                   Q, k, v, B_pwT_dkdv_start, sm_scale,  #
                    DO,  #
                    Logsumexp, D,  #
                    stride_l2, stride_d,  #
+                   stride_b_pw_l1, stride_b_pw_l2,  #
                    H, L, BLOCK_QL2: tl.constexpr,  #
                    BLOCK_KL2: tl.constexpr,  #
                    HEAD_DIM: tl.constexpr,  #
@@ -302,15 +303,14 @@ def _attn_bwd_dkdv(dk, dv,  #
     """
     Computes gradients with respect to keys (dk) and values (dv)--each warp/program
     loops over the Q dimension, and accumulates dkdv in sram.
+    dk, dv, k, v are SRAM tensors.
+    Q, DO, B_pw are in HBM.
+    
+    (Note that we loop over Q, which corresponds to b_pw_l1)
     """
-    # Initialize offsets for the current block
-    offs_ql2_1d = tl.arange(0, BLOCK_QL2)
-    offs_kl2 = tl.arange(0, BLOCK_KL2)
+    # Initialize offsets for the current block--this is the shared between the 1d and 2d tensors
+    offs_ql2 = tl.arange(0, BLOCK_QL2)
     offs_d = tl.arange(0, HEAD_DIM)
-
-    # Setup pointers for Q and DO tensors
-    qT_ptrs = Q + offs_ql2_1d[None, :] * stride_l2 + offs_d[:, None] * stride_d
-    do_ptrs = DO + offs_ql2_1d[:, None] * stride_l2 + offs_d[None, :] * stride_d
 
     # Ensure block sizes are compatible
     tl.static_assert(BLOCK_KL2 % BLOCK_QL2 == 0)
@@ -319,26 +319,38 @@ def _attn_bwd_dkdv(dk, dv,  #
     curr_ql2 = 0
     step_ql2 = BLOCK_QL2
 
+
+    # Setup pointers for Q and DO tensors
+    qT_ptrs = Q + offs_ql2[None, :] * stride_l2 + offs_d[:, None] * stride_d
+    do_ptrs = DO + offs_ql2[:, None] * stride_l2 + offs_d[None, :] * stride_d
+    b_pw_ptrs = B_pwT_dkdv_start + offs_ql2[None, :] * stride_b_pw_l1 
+
     # Process blocks to compute gradients
     while curr_ql2 < L:
-        breakpoint() # Checking rematerialization first
+        # For the 1d tensors the stride is just 1
+        offs_ql2_1d = curr_ql2 + offs_ql2
+        lse = tl.load(Logsumexp + offs_ql2_1d)
         # Load Q values and compute Q*K^T
         qT = tl.load(qT_ptrs)
-        # For the 1d tensors the stride is just 1
-        offs_ql2_1d = curr_ql2 + tl.arange(0, BLOCK_QL2)
-        lse = tl.load(Logsumexp + offs_ql2_1d)
+        # Load B_pw values
+        b_pwT = tl.load(b_pw_ptrs)
+        # Load precomputed deltas
+        Di = tl.load(D + offs_ql2_1d)
+
         qkT = tl.dot(k, qT)
+        qkT_scaled = qkT * sm_scale
+        qkT_scaled_bias = qkT_scaled + b_pwT
+        aT = qkT_scaled_bias * 1.44269504 #08889634 # 1/log(2)
+        # * sm_scale -> * bias -> * 1/log(2), which is what lse has built in.
 
         # Recompute attention probabilities using cached logsumexp values
-        pT = tl.math.exp2(qkT - lse[None, :])
+        # Careful to use exp2 here and lse along the Q dimension (which is last because of inverse)
+        pT = tl.math.exp2(aT - lse[None, :])
 
         do = tl.load(do_ptrs)
 
         ppT = pT.to(tl.float16)
         dv += tl.dot(ppT, do)
-
-        # Load precomputed deltas
-        Di = tl.load(D + offs_ql2_1d)
 
         # Compute dP (gradient of probabilities) and dS (gradient of scores)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
@@ -352,6 +364,7 @@ def _attn_bwd_dkdv(dk, dv,  #
         curr_ql2 += step_ql2
         qT_ptrs += step_ql2 * stride_l2
         do_ptrs += step_ql2 * stride_l2
+        b_pw_ptrs += step_ql2 * stride_b_pw_l1
 
     return dk, dv
 
@@ -387,42 +400,47 @@ def _attn_bwd_dq(dq, q, K, V,  #
     tl.static_assert(BLOCK_QL2 % BLOCK_KL2 == 0)
 
     # Initialize tracking variables
-    curr_n = 0
-    step_n = BLOCK_KL2
+    curr_kl2 = 0
+    step_kl2 = BLOCK_KL2
 
     # Process blocks to compute gradients
-    while curr_n < L:
+    while curr_kl2 < L:
         # Load K and V values
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
 
         # Compute attention scores
         qk = tl.dot(q, kT)
+        # TODO: Need to reapply bias and scaling here.
+        # * sm_scale -> * bias -> * 1/log(2), which is what lse has built in.
+
         p = tl.math.exp2(qk - lse)
 
         # Compute gradients
         dp = tl.dot(do, vT).to(tl.float32)  # Gradient wrt attention probabilities
         ds = p * (dp - Di[:, None])  # Gradient wrt attention scores
         ds = ds.to(tl.float16)
+        # TODO: add ds dimension to db_pw
 
         # Update query gradients
         dq += tl.dot(ds, tl.trans(kT))
 
         # Update pointers for next iteration
-        curr_n += step_n
-        kT_ptrs += step_n * stride_l2
-        vT_ptrs += step_n * stride_l2
+        curr_kl2 += step_kl2
+        kT_ptrs += step_kl2 * stride_l2
+        vT_ptrs += step_kl2 * stride_l2
 
     return dq
 
 
 @triton.jit
-def _attn_bwd(Q, K, V, sm_scale,  #
+def _attn_bwd(Q, K, V, B_pw, sm_scale,  #
               DO,  #
-              DQ, DK, DV,  #
+              DQ, DK, DV, DB_pw, #
               Logsumexp, OdO,
               # shared by Q/K/V/DO.
               stride_b, stride_h, stride_l1, stride_l2, stride_d,  #
+              stride_b_pw_b, stride_b_pw_h, stride_b_pw_l1, stride_b_pw_l2,  #
               H, L,  #
               DKDV_BLOCK_QL2: tl.constexpr,  #
               DKDV_BLOCK_KL2: tl.constexpr,  #
@@ -441,6 +459,11 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     # For the 1d logsumexp and OdO tensors, assume stride of 1
     off_bh_1d = (bhl1_id * L).to(tl.int64)
     adj = stride_b * off_b_2d + stride_h * off_h_2d + stride_l1 * off_l1_2d
+
+    # b_pw doesn't have l1 dimension, so need to adjust for that.
+    # TODO: performance optimization opportunity here to group
+    # l1 programs close together?
+    offs_b_pw = stride_b_pw_b * off_b_2d + stride_b_pw_h * off_h_2d
     pid = tl.program_id(0)
 
     # offset pointers for batch/head
@@ -451,6 +474,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     DQ += adj
     DK += adj
     DV += adj
+    DB_pw += offs_b_pw
     Logsumexp += off_bh_1d
     OdO += off_bh_1d
 
@@ -459,7 +483,6 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     offs_d = tl.arange(0, HEAD_DIM)
 
     start_kl2 = pid * DKDV_BLOCK_KL2
-    start_ql2 = start_kl2
 
     offs_kl2 = start_kl2 + tl.arange(0, DKDV_BLOCK_KL2)
 
@@ -469,13 +492,16 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     # load K and V: they stay in SRAM throughout the inner loop.
     k = tl.load(K + offs_kl2[:, None] * stride_l2 + offs_d[None, :] * stride_d)
     v = tl.load(V + offs_kl2[:, None] * stride_l2 + offs_d[None, :] * stride_d)
-
+    
+    # For dkdv, fix kv dimension and loop over b_pw_l1. Shape (KL2, 1)
+    B_pwT_dkdv_start = B_pw + offs_kl2[:, None] * stride_b_pw_l2
 
     dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                            Q, k, v, sm_scale,  #
+                            Q, k, v, B_pwT_dkdv_start, sm_scale,  #
                             DO,  #
                             Logsumexp, OdO,  #
                             stride_l2, stride_d,  #
+                            stride_b_pw_l1, stride_b_pw_l2,  #
                             H, L,  #
                             DKDV_BLOCK_QL2, DKDV_BLOCK_KL2, HEAD_DIM,  #
                             )
@@ -489,6 +515,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     tl.store(dk_ptrs, dk)
 
     # Compute dQ. Tile over Q dimension and loop over KV dimension.
+    start_ql2 = pid * DQ_BLOCK_QL2
     offs_ql2 = start_ql2 + tl.arange(0, DQ_BLOCK_QL2)
 
     q = tl.load(Q + offs_ql2[:, None] * stride_l2 + offs_d[None, :] * stride_d)
@@ -555,7 +582,7 @@ class _attention(torch.autograd.Function):
             o_debug, logsumexp_debug = reference_tt_tiled(q, k, v, b_pw, sm_scale)
 
         # Save tensors needed for backward pass
-        ctx.save_for_backward(q, k, v, o, M)
+        ctx.save_for_backward(q, k, v, o, b_pw, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.dtype = dtype
@@ -566,17 +593,19 @@ class _attention(torch.autograd.Function):
         dtype = ctx.dtype
         assert do.dtype == dtype
         # Retrieve saved tensors from forward pass
-        q, k, v, o, logsumexp = ctx.saved_tensors
+        q, k, v, o, b_pw, logsumexp = ctx.saved_tensors
 
 
         # Verify gradient tensor properties
         assert do.is_contiguous()
+        # Note: b_pw doesn't have l1 dimension, so stride is different.
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
 
         # Initialize gradient tensors
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
+        db_pw = torch.empty_like(b_pw)
 
         # Get tensor dimensions
         B, H, L, L, D = q.shape
@@ -588,8 +617,9 @@ class _attention(torch.autograd.Function):
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
 
         # Scale key tensor for gradient computation
-        # TODO: want to investigate this--source of bugs here
-        arg_k = k * (ctx.sm_scale * RCP_LN2)
+        # arg_k = k * (ctx.sm_scale * RCP_LN2)
+        # UPDATE: Since bias happens between these, will need to be included 
+        # in the kernel directly.
 
         # Verify context size is compatible with block size
         assert L % PRE_BLOCK == 0
@@ -622,9 +652,10 @@ class _attention(torch.autograd.Function):
 
         # Compute gradients
         _attn_bwd[grid](
-            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
+            q, k, v, b_pw, ctx.sm_scale, do, dq, dk, dv, db_pw,
             logsumexp, o_do,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
+            b_pw.stride(0), b_pw.stride(1), b_pw.stride(2), b_pw.stride(3),
             H=H, L=L,
             DKDV_BLOCK_QL2=DKDV_BLOCK_QL2, DKDV_BLOCK_KL2=DKDV_BLOCK_KL2,
             DQ_BLOCK_QL2=DQ_BLOCK_QL2, DQ_BLOCK_KL2=DQ_BLOCK_KL2,
@@ -682,6 +713,7 @@ def test_op(Z, H, L, HEAD_DIM, dtype=torch.float16):
         tri_dq, q.grad = q.grad.clone(), None
 
         # Verify gradients match
+        # NOTE: this doesn't pass but 0,0,0 does.... 
         assert torch.allclose(ref_dv, tri_dv, atol=1e-2)
         assert torch.allclose(ref_dk, tri_dk, atol=1e-2)
         assert torch.allclose(ref_dq, tri_dq, atol=1e-2)
@@ -843,7 +875,7 @@ def reference_tt_attn(q, k, v, b, sm_scale):
 
 if __name__ == "__main__":
     # Run basic correctness test
-    test_op(Z=1, H=1, L=128, HEAD_DIM=64, dtype=torch.float16)
+    test_op(Z=2, H=2, L=128, HEAD_DIM=64, dtype=torch.float16)
     # test_op(Z=1, H=1, L=256, HEAD_DIM=32, dtype=torch.float32)
     # test_op(Z=2, H=4, L=256, HEAD_DIM=8, dtype=torch.float16)
 
