@@ -217,7 +217,6 @@ def manual_triangular_attention_gradients(d_out, Q, K, V, B_pw, P, sm_scale):
             dA[:, :, :, j, :] = ((diag_p - p_outer_p) @ dP[:, :, :, j, :, None]).squeeze(-1)
         return dA
     d_scaled_A = d_softmax(P, dP) # Shape (B, H, L, L, L)
-    breakpoint()
     assert d_scaled_A.shape == (B, H, L, L, L)
     dB_pw = d_scaled_A.sum(dim=2)
     dA = d_scaled_A * sm_scale
