@@ -889,6 +889,7 @@ class _attention(torch.autograd.Function):
         
         # Initialize delta tensor for gradient computation
         delta = torch.empty_like(M)
+        breakpoint()
         
         # Preprocess gradients
         _attn_bwd_preprocess[pre_grid](

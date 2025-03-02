@@ -156,8 +156,8 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
 
     Of these, step 3 is not handled by out-of-the-box flash attention.
     """
-    # Ensure block size doesn't exceed head dimension
-    tl.static_assert(BLOCK_KL2 <= D, "Block size (BLOCK_KL2) must not exceed head dimension (D)")
+    # Ensure block size doesn't exceed head dimension? TODO: is this needed?
+    tl.static_assert(BLOCK_KL2 <= D, f"Block size (BLOCK_KL2) must not exceed head dimension (D)--expected {BLOCK_KL2} <= {D}")
 
     # Grid dimension explanation:
     # - program_id(0): Indexes along inner sequence length (L/BLOCK_QL2 blocks)
@@ -321,7 +321,7 @@ def _attn_bwd_dkdv(dk, dv,  #
 
     # Process blocks to compute gradients
     while curr_ql2 < L:
-        breakpoint()
+        breakpoint() # Checking rematerialization first
         # Load Q values and compute Q*K^T
         qT = tl.load(qT_ptrs)
         # For the 1d tensors the stride is just 1
@@ -511,12 +511,15 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 
 
 class _attention(torch.autograd.Function):
+    debugging_backward_pass = True
     @staticmethod
     def forward(ctx, q, k, v, b_pw, sm_scale):
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        assert q.dtype == k.dtype == v.dtype == b_pw.dtype
+        dtype = q.dtype
 
         # Initialize output tensor
         o = torch.empty_like(q)
@@ -524,17 +527,19 @@ class _attention(torch.autograd.Function):
         # Initialize scaling factor storage
         # M is the max val for each query position--QL2.
         # Shape (B, H, L1, L2), equivalent to attn_scores.max(dim=-1)
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2], q.shape[3]), device=q.device, dtype=torch.float32)
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2], q.shape[3]), device=q.device, dtype=dtype)
 
         def grid(args):
             return (triton.cdiv(q.shape[-2], args["BLOCK_QL2"]), q.shape[-3], q.shape[0] * q.shape[1])
 
         ctx.grid = grid
 
-        debugging_backward_pass = False
-        if debugging_backward_pass:
+        if _attention.debugging_backward_pass:
             o, logsumexp = reference_tt_tiled(q, k, v, b_pw, sm_scale)
             M = logsumexp
+            assert o.dtype == dtype
+            # M should be fp32
+            assert M.dtype == torch.float32
         else:
             # Launch regular kernel
             _attn_fwd[grid](
@@ -546,19 +551,23 @@ class _attention(torch.autograd.Function):
             b_pw.stride(0), b_pw.stride(1), b_pw.stride(2), b_pw.stride(3),
             B=q.shape[0], H=q.shape[1], L=q.shape[2],
             D=HEAD_DIM_K,
-        )
+            )
+            o_debug, logsumexp_debug = reference_tt_tiled(q, k, v, b_pw, sm_scale)
 
         # Save tensors needed for backward pass
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.dtype = dtype
         return o
 
     @staticmethod
     def backward(ctx, do):
-        dtype = do.dtype
+        dtype = ctx.dtype
+        assert do.dtype == dtype
         # Retrieve saved tensors from forward pass
         q, k, v, o, logsumexp = ctx.saved_tensors
+
 
         # Verify gradient tensor properties
         assert do.is_contiguous()
@@ -591,17 +600,21 @@ class _attention(torch.autograd.Function):
         # Initialize delta tensor for gradient computation
         o_do = torch.empty_like(logsumexp)
 
-        # Preprocess gradients
-        _attn_bwd_preprocess[pre_grid](
-            o, do,
-            o_do,
-            B, H, L,
-            BLOCK_QL2=PRE_BLOCK, D=ctx.HEAD_DIM
-        )
+        if _attention.debugging_backward_pass:
+            # Triton bug with the interpreter--workaround 
+            # for now 
+            o_do = (o * do).sum(dim=-1)
+        else:
+            # Preprocess gradients
+            _attn_bwd_preprocess[pre_grid](
+                o, do,
+                o_do,
+                B, H, L,
+                BLOCK_QL2=PRE_BLOCK, D=ctx.HEAD_DIM
+            )
 
         # quick assert on odo
         # TODO: clean up the dtype handling overall.
-        breakpoint()
         assert torch.allclose(o_do.to(dtype), (o * do).sum(dim=-1), atol=1e-3)
 
         # Define main backward pass grid dimensions
@@ -655,8 +668,8 @@ def test_op(Z, H, L, HEAD_DIM, dtype=torch.float16):
     ref_db, b.grad = b.grad.clone(), None
 
     # Triton implementation
-    # tri_out = attention(q, k, v, b, sm_scale).to(dtype)
-    tri_out = attention(q, k, v, b, sm_scale).half()
+    tri_out = attention(q, k, v, b, sm_scale).to(dtype)
+    # tri_out = attention(q, k, v, b, sm_scale).half()
 
     # Compare results--forward pass
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
@@ -830,7 +843,7 @@ def reference_tt_attn(q, k, v, b, sm_scale):
 
 if __name__ == "__main__":
     # Run basic correctness test
-    test_op(Z=1, H=1, L=256, HEAD_DIM=32, dtype=torch.float16)
+    test_op(Z=1, H=1, L=128, HEAD_DIM=64, dtype=torch.float16)
     # test_op(Z=1, H=1, L=256, HEAD_DIM=32, dtype=torch.float32)
     # test_op(Z=2, H=4, L=256, HEAD_DIM=8, dtype=torch.float16)
 

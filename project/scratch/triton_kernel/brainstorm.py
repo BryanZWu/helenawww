@@ -126,6 +126,9 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
         sm_scale: Scale factor for attention scores
         BLOCK_N: Block size for tiling (default: 64)
     """
+    orig_dtype = q.dtype
+    assert orig_dtype == k.dtype == v.dtype == b.dtype
+    q, k, v, b = q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), b.to(torch.float32)
     Z, H, N_CTX, _, D = q.shape
     out = torch.zeros_like(q)
     
@@ -190,7 +193,7 @@ def reference_tt_tiled(q, k, v, b, sm_scale, BLOCK_N=64, BLOCK_M=64):
                     logsumexp_agg[z, h, n1, start_m:end_m] = m_i + torch.log2(l_i)
                     out[z, h, n1, start_m:end_m, :] = acc
 
-    return out, logsumexp_agg
+    return out.to(orig_dtype), logsumexp_agg # intentionally fp32
 
 
 def manual_triangular_attention_gradients(d_out, Q, K, V, B_pw, P, sm_scale):
