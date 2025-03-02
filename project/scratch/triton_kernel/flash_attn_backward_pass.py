@@ -549,39 +549,39 @@ class _attention(torch.autograd.Function):
     def backward(ctx, do):
         # Retrieve saved tensors from forward pass
         q, k, v, o, M = ctx.saved_tensors
-        
+
         # Verify gradient tensor properties
         assert do.is_contiguous()
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
-        
+
         # Initialize gradient tensors
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        
+
         # Get tensor dimensions
         B, H, L, L, D = q.shape
-        
+
         # Define block sizes and parameters
         PRE_BLOCK = 128
         NUM_WARPS, NUM_STAGES = 4, 5
         DKDV_BLOCK_QL2, DKDV_BLOCK_KL2, DQ_BLOCK_QL2, DQ_BLOCK_KL2 = 32, 128, 128, 32
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
-        
+
         # Scale key tensor for gradient computation
         # TODO: want to investigate this--source of bugs here
         arg_k = k * (ctx.sm_scale * RCP_LN2)
-        
+
         # Verify context size is compatible with block size
         assert L % PRE_BLOCK == 0
 
         # Define preprocessing grid dimensions
         pre_grid = (L // PRE_BLOCK, B * H)
-        
+
         # Initialize delta tensor for gradient computation
         delta = torch.empty_like(M)
-        
+
         # Preprocess gradients
         _attn_bwd_preprocess[pre_grid](
             o, do,
@@ -589,10 +589,10 @@ class _attention(torch.autograd.Function):
             B, H, L,
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM
         )
-        
+
         # Define main backward pass grid dimensions
         grid = (L // DKDV_BLOCK_KL2, 1, B * H)
-        
+
         # Compute gradients
         _attn_bwd[grid](
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
