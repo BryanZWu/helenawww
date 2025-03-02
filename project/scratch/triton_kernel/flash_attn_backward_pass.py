@@ -548,7 +548,7 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         # Retrieve saved tensors from forward pass
-        q, k, v, o, M = ctx.saved_tensors
+        q, k, v, o, logsumexp = ctx.saved_tensors
 
         # Verify gradient tensor properties
         assert do.is_contiguous()
@@ -566,7 +566,6 @@ class _attention(torch.autograd.Function):
         PRE_BLOCK = 128
         NUM_WARPS, NUM_STAGES = 4, 5
         DKDV_BLOCK_QL2, DKDV_BLOCK_KL2, DQ_BLOCK_QL2, DQ_BLOCK_KL2 = 32, 128, 128, 32
-        BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
 
         # Scale key tensor for gradient computation
@@ -580,14 +579,14 @@ class _attention(torch.autograd.Function):
         pre_grid = (L // PRE_BLOCK, B * H)
 
         # Initialize delta tensor for gradient computation
-        delta = torch.empty_like(M)
+        o_do = torch.empty_like(logsumexp)
 
         # Preprocess gradients
         _attn_bwd_preprocess[pre_grid](
             o, do,
-            delta,
+            o_do,
             B, H, L,
-            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM
+            BLOCK_QL2=PRE_BLOCK, D=ctx.HEAD_DIM
         )
 
         # Define main backward pass grid dimensions
@@ -596,12 +595,11 @@ class _attention(torch.autograd.Function):
         # Compute gradients
         _attn_bwd[grid](
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
-            M, delta,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            H, L,
-            BLOCK_M1=DKDV_BLOCK_QL2, BLOCK_N1=DKDV_BLOCK_KL2,
-            BLOCK_M2=DQ_BLOCK_QL2, BLOCK_N2=DQ_BLOCK_KL2,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            logsumexp, o_do,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
+            H=H, L=L,
+            DKDV_BLOCK_QL2=DKDV_BLOCK_QL2, DKDV_BLOCK_KL2=DKDV_BLOCK_KL2,
+            DQ_BLOCK_QL2=DQ_BLOCK_QL2, DQ_BLOCK_KL2=DQ_BLOCK_KL2,
             HEAD_DIM=ctx.HEAD_DIM,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES
@@ -647,7 +645,7 @@ def test_op(Z, H, L, HEAD_DIM, dtype=torch.float16):
     # Compare results--forward pass
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
 
-    backwards_pass_implemented = False
+    backwards_pass_implemented = True
     if backwards_pass_implemented:
         tri_out.backward(dout)
         tri_dv, v.grad = v.grad.clone(), None
@@ -816,7 +814,8 @@ def reference_tt_attn(q, k, v, b, sm_scale):
 
 if __name__ == "__main__":
     # Run basic correctness test
-    test_op(Z=2, H=4, L=128, HEAD_DIM=32, dtype=torch.float16)
+    test_op(Z=1, H=1, L=256, HEAD_DIM=32, dtype=torch.float16)
+    # test_op(Z=2, H=4, L=256, HEAD_DIM=8, dtype=torch.float16)
 
     # Run benchmarks
-    bench_attention.run(save_path="test_results/", print_data=True)
+    # bench_attention.run(save_path="test_results/", print_data=True)
