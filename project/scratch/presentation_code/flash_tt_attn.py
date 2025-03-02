@@ -35,6 +35,8 @@ import triton.language as tl
 
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
+INV_LN2: tl.constexpr = 1.4426950408889634  # = 1/ln(2)
+
 # Helper function to check if we're using HIP (AMD) backend
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
@@ -237,7 +239,7 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
     acc = tl.zeros([BLOCK_QL2, D], dtype=tl.float32)      # Accumulated attention outputs
 
     pre_bias_qk_scale = sm_scale # 1/sqrt(head_dim)
-    post_bias_qk_scale = 1.44269504 # 1/log(2), to account for log2 in softmax
+    post_bias_qk_scale = INV_LN2
 
     # Load query block - remains in SRAM throughout computation
     q = tl.load(Q_block_ptr)

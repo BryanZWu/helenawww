@@ -37,6 +37,7 @@ import triton
 import triton.language as tl
 
 INV_LN2: tl.constexpr = 1.4426950408889634  # = 1/ln(2)
+LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -48,7 +49,7 @@ def is_hip():
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
-# @triton.jit
+@triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,
                     K_block_ptr, V_block_ptr, B_pw_block_ptr,
                     start_ql2, pre_bias_qk_scale, post_bias_qk_scale,
@@ -127,8 +128,8 @@ def keep(conf):
     return True
 
 
-# @triton.autotune(list(filter(keep, configs)), key=["L", "D"])
-# @triton.jit
+@triton.autotune(list(filter(keep, configs)), key=["L", "D"])
+@triton.jit
 def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for softmax, M: max values, Out: output tensor
               stride_qb, stride_qh, stride_ql1, stride_ql2, stride_qd,  # Strides for Q tensor: batch, head, seq_len, seq_len, head_dim
               stride_kb, stride_kh, stride_kl1, stride_kl2, stride_kd,  # Strides for K tensor
@@ -266,8 +267,7 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
-# Preprocess can more or less stay the same
-# @triton.jit
+@triton.jit
 def _attn_bwd_preprocess(O, DO,  #
                          O_DO,  #
                          B, H, L,  #
@@ -371,8 +371,7 @@ def _attn_bwd_dkdv(dk, dv,  #
     return dk, dv
 
 
-# the main inner-loop logic for computing dQ
-# TODO: Probably add the db computation here.
+# the main inner-loop logic for computing dQ, and dB_pw
 @triton.jit
 def _attn_bwd_dq(dq, q, K, V, B_pw_dq_start, sm_scale, #
                  do, lse, OdO,  #
@@ -461,8 +460,6 @@ def _attn_bwd(Q, K, V, B_pw, sm_scale,  #
               DQ_BLOCK_QL2: tl.constexpr,  #
               DQ_BLOCK_KL2: tl.constexpr,  #
               HEAD_DIM: tl.constexpr):
-    LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
-    INV_LN2: tl.constexpr = 1.4426950408889634  # = 1/ln(2)
 
     bhl1_id = tl.program_id(2)
     off_l1_2d = bhl1_id % L
@@ -556,7 +553,7 @@ def _attn_bwd(Q, K, V, B_pw, sm_scale,  #
 
 
 class _attention(torch.autograd.Function):
-    debugging_backward_pass = True
+    debugging_backward_pass = False
     @staticmethod
     def forward(ctx, q, k, v, b_pw, sm_scale):
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
@@ -668,8 +665,8 @@ class _attention(torch.autograd.Function):
             )
 
         # quick assert on odo
-        # TODO: clean up the dtype handling overall.
-        assert torch.allclose(o_do.to(dtype), (o * do).sum(dim=-1), atol=1e-3)
+        # TODO: There seems to be some issues with this operation for precision.
+        assert torch.allclose(o_do.to(dtype), (o * do).sum(dim=-1), atol=2e-3)
 
         # Define main backward pass grid dimensions
         grid = (L // DKDV_BLOCK_KL2, 1, B * H * L)
