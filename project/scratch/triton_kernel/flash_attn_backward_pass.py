@@ -452,9 +452,9 @@ def _attn_bwd(Q, K, V, B_pw, sm_scale,  #
 
     bhl1_id = tl.program_id(2)
     off_l1_2d = bhl1_id % L
-    bhl1_id = bhl1_id // L
-    off_h_2d = bhl1_id % H
-    off_b_2d = bhl1_id // H
+    bh1_id = bhl1_id // L
+    off_h_2d = bh1_id % H
+    off_b_2d = bh1_id // H
 
     # For the 1d logsumexp and OdO tensors, assume stride of 1
     off_bh_1d = (bhl1_id * L).to(tl.int64)
@@ -607,6 +607,12 @@ class _attention(torch.autograd.Function):
         dv = torch.empty_like(v)
         db_pw = torch.empty_like(b_pw)
 
+        # Initialize to zeros for easier debugging
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+        db_pw = torch.zeros_like(b_pw)
+
         # Get tensor dimensions
         B, H, L, L, D = q.shape
 
@@ -685,6 +691,7 @@ def test_op(Z, H, L, HEAD_DIM, dtype=torch.float16):
     k = (torch.empty((Z, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     v = (torch.empty((Z, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     b = (torch.empty((Z, H, L, L), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    b = torch.zeros_like(b, requires_grad=True) # Turn off bias for now
     sm_scale = 0.5
     dout = torch.randn_like(q)
 
