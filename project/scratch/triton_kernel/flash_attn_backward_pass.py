@@ -290,10 +290,10 @@ def _attn_bwd_preprocess(O, DO,  #
 def _attn_bwd_dkdv(dk, dv,  #
                    Q, k, v, sm_scale,  #
                    DO,  #
-                   M, D,  #
+                   Logsumexp, D,  #
                    stride_tok, stride_d,  #
-                   H, L, BLOCK_M1: tl.constexpr,  #
-                   BLOCK_N1: tl.constexpr,  #
+                   H, L, BLOCK_QL2: tl.constexpr,  #
+                   BLOCK_KL2: tl.constexpr,  #
                    HEAD_DIM: tl.constexpr,  #
                 ):
     """
@@ -301,8 +301,8 @@ def _attn_bwd_dkdv(dk, dv,  #
     loops over the Q dimension, and accumulates dkdv in sram.
     """
     # Initialize offsets for the current block
-    offs_m = tl.arange(0, BLOCK_M1)
-    offs_n = tl.arange(0, BLOCK_N1)
+    offs_m = tl.arange(0, BLOCK_QL2)
+    offs_n = tl.arange(0, BLOCK_KL2)
     offs_d = tl.arange(0, HEAD_DIM)
 
     # Setup pointers for Q and DO tensors
@@ -310,18 +310,18 @@ def _attn_bwd_dkdv(dk, dv,  #
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_d[None, :] * stride_d
 
     # Ensure block sizes are compatible
-    tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
+    tl.static_assert(BLOCK_KL2 % BLOCK_QL2 == 0)
 
     # Initialize tracking variables
-    curr_m = 0
-    step_m = BLOCK_M1
+    curr_ql2 = 0
+    step_m = BLOCK_QL2
 
     # Process blocks to compute gradients
-    while curr_m < L:
+    while curr_ql2 < L:
         # Load Q values and compute Q*K^T
         qT = tl.load(qT_ptrs)
-        offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        m = tl.load(M + offs_m)
+        offs_m = curr_ql2 + tl.arange(0, BLOCK_QL2)
+        m = tl.load(Logsumexp + offs_m)
         qkT = tl.dot(k, qT)
 
         # Compute attention probabilities
@@ -346,7 +346,7 @@ def _attn_bwd_dkdv(dk, dv,  #
         dk += tl.dot(dsT, tl.trans(qT))
 
         # Update pointers for next iteration
-        curr_m += step_m
+        curr_ql2 += step_m
         qT_ptrs += step_m * stride_tok
         do_ptrs += step_m * stride_tok
 
@@ -357,10 +357,10 @@ def _attn_bwd_dkdv(dk, dv,  #
 @triton.jit
 def _attn_bwd_dq(dq, q, K, V,  #
                  do, m, D,  #
-                 stride_tok, stride_d,  #
+                 stride_l2, stride_d,  #
                  H, L,  #
-                 BLOCK_M2: tl.constexpr,  #
-                 BLOCK_N2: tl.constexpr,  #
+                 BLOCK_QL2: tl.constexpr,  #
+                 BLOCK_KL2: tl.constexpr,  #
                  HEAD_DIM: tl.constexpr,  #
         ):
     """
@@ -368,23 +368,23 @@ def _attn_bwd_dq(dq, q, K, V,  #
     loops over the KV sequence dimension, and accumulates dq in sram.
     """
     # Initialize offsets for the current block
-    offs_m = tl.arange(0, BLOCK_M2)
-    offs_n = tl.arange(0, BLOCK_N2)
+    offs_ql2 = tl.arange(0, BLOCK_QL2)
+    offs_kl2 = tl.arange(0, BLOCK_KL2)
     offs_d = tl.arange(0, HEAD_DIM)
 
     # Setup pointers for K and V tensors
-    kT_ptrs = K + offs_n[None, :] * stride_tok + offs_d[:, None] * stride_d
-    vT_ptrs = V + offs_n[None, :] * stride_tok + offs_d[:, None] * stride_d
+    kT_ptrs = K + offs_kl2[None, :] * stride_l2 + offs_d[:, None] * stride_d
+    vT_ptrs = V + offs_kl2[None, :] * stride_l2 + offs_d[:, None] * stride_d
 
     # Load precomputed deltas
-    Di = tl.load(D + offs_m)
+    Di = tl.load(D + offs_ql2)
 
     # Ensure block sizes are compatible
-    tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
+    tl.static_assert(BLOCK_QL2 % BLOCK_KL2 == 0)
 
     # Initialize tracking variables
     curr_n = 0
-    step_n = BLOCK_N2
+    step_n = BLOCK_KL2
 
     # Process blocks to compute gradients
     while curr_n < L:
@@ -396,12 +396,6 @@ def _attn_bwd_dq(dq, q, K, V,  #
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
 
-        # Apply causal masking if needed
-        if MASK:
-            offs_n = curr_n + tl.arange(0, BLOCK_N2)
-            mask = (offs_m[:, None] >= offs_n[None, :])
-            p = tl.where(mask, p, 0.0)
-
         # Compute gradients
         dp = tl.dot(do, vT).to(tl.float32)  # Gradient wrt attention probabilities
         ds = p * (dp - Di[:, None])  # Gradient wrt attention scores
@@ -412,8 +406,8 @@ def _attn_bwd_dq(dq, q, K, V,  #
 
         # Update pointers for next iteration
         curr_n += step_n
-        kT_ptrs += step_n * stride_tok
-        vT_ptrs += step_n * stride_tok
+        kT_ptrs += step_n * stride_l2
+        vT_ptrs += step_n * stride_l2
 
     return dq
 
@@ -497,15 +491,14 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     dq = tl.zeros([DQ_BLOCK_QL2, HEAD_DIM], dtype=tl.float32)
     do = tl.load(DO + offs_m[:, None] * stride_l2 + offs_d[None, :] * stride_d)
 
-    m = tl.load(Logsumexp + offs_m)
-    m = m[:, None]
+    lse = tl.load(Logsumexp + offs_m)
+    lse = lse[:, None]
 
     dq = _attn_bwd_dq(dq, q, K, V,  #
-                      do, m, OdO,  #
+                      do, lse, OdO,  #
                       stride_l2, stride_d,  #
                       H, L,  #
                       DQ_BLOCK_QL2, DQ_BLOCK_KL2, HEAD_DIM,  #
-                      start_ql2, end_n - num_steps * DQ_BLOCK_KL2, num_steps,  #
                       )
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_l2 + offs_d[None, :] * stride_d
