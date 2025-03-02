@@ -291,7 +291,7 @@ def _attn_bwd_dkdv(dk, dv,  #
                    Q, k, v, sm_scale,  #
                    DO,  #
                    Logsumexp, D,  #
-                   stride_tok, stride_d,  #
+                   stride_l2, stride_d,  #
                    H, L, BLOCK_QL2: tl.constexpr,  #
                    BLOCK_KL2: tl.constexpr,  #
                    HEAD_DIM: tl.constexpr,  #
@@ -301,13 +301,13 @@ def _attn_bwd_dkdv(dk, dv,  #
     loops over the Q dimension, and accumulates dkdv in sram.
     """
     # Initialize offsets for the current block
-    offs_ql2 = tl.arange(0, BLOCK_QL2)
+    offs_ql2_1d = tl.arange(0, BLOCK_QL2)
     offs_kl2 = tl.arange(0, BLOCK_KL2)
     offs_d = tl.arange(0, HEAD_DIM)
 
     # Setup pointers for Q and DO tensors
-    qT_ptrs = Q + offs_ql2[None, :] * stride_tok + offs_d[:, None] * stride_d
-    do_ptrs = DO + offs_ql2[:, None] * stride_tok + offs_d[None, :] * stride_d
+    qT_ptrs = Q + offs_ql2_1d[None, :] * stride_l2 + offs_d[:, None] * stride_d
+    do_ptrs = DO + offs_ql2_1d[:, None] * stride_l2 + offs_d[None, :] * stride_d
 
     # Ensure block sizes are compatible
     tl.static_assert(BLOCK_KL2 % BLOCK_QL2 == 0)
@@ -320,22 +320,21 @@ def _attn_bwd_dkdv(dk, dv,  #
     while curr_ql2 < L:
         # Load Q values and compute Q*K^T
         qT = tl.load(qT_ptrs)
-        offs_ql2 = curr_ql2 + tl.arange(0, BLOCK_QL2)
-        lse = tl.load(Logsumexp + offs_ql2)
+        # For the 1d tensors the stride is just 1
+        offs_ql2_1d = curr_ql2 + tl.arange(0, BLOCK_QL2)
+        lse = tl.load(Logsumexp + offs_ql2_1d)
         qkT = tl.dot(k, qT)
 
-        # Compute attention probabilities
+        # Recompute attention probabilities using cached logsumexp values
         pT = tl.math.exp2(qkT - lse[None, :])
 
-        # Load gradients
         do = tl.load(do_ptrs)
 
-        # Compute dV gradients
         ppT = pT.to(tl.float16)
         dv += tl.dot(ppT, do)
 
         # Load precomputed deltas
-        Di = tl.load(D + offs_ql2)
+        Di = tl.load(D + offs_ql2_1d)
 
         # Compute dP (gradient of probabilities) and dS (gradient of scores)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
@@ -347,16 +346,17 @@ def _attn_bwd_dkdv(dk, dv,  #
 
         # Update pointers for next iteration
         curr_ql2 += step_ql2
-        qT_ptrs += step_ql2 * stride_tok
-        do_ptrs += step_ql2 * stride_tok
+        qT_ptrs += step_ql2 * stride_l2
+        do_ptrs += step_ql2 * stride_l2
 
     return dk, dv
 
 
 # the main inner-loop logic for computing dQ
+# TODO: Probably add the db computation here.
 @triton.jit
 def _attn_bwd_dq(dq, q, K, V,  #
-                 do, m, D,  #
+                 do, lse, D,  #
                  stride_l2, stride_d,  #
                  H, L,  #
                  BLOCK_QL2: tl.constexpr,  #
@@ -394,7 +394,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
 
         # Compute attention scores
         qk = tl.dot(q, kT)
-        p = tl.math.exp2(qk - m)
+        p = tl.math.exp2(qk - lse)
 
         # Compute gradients
         dp = tl.dot(do, vT).to(tl.float32)  # Gradient wrt attention probabilities
@@ -484,14 +484,14 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     dk_ptrs = DK + offs_kl2[:, None] * stride_l2 + offs_d[None, :] * stride_d
     tl.store(dk_ptrs, dk)
 
-    # THIS BLOCK DOES DQ:
-    offs_m = start_ql2 + tl.arange(0, DQ_BLOCK_QL2)
+    # Compute dQ. Tile over Q dimension and loop over KV dimension.
+    offs_ql2 = start_ql2 + tl.arange(0, DQ_BLOCK_QL2)
 
-    q = tl.load(Q + offs_m[:, None] * stride_l2 + offs_d[None, :] * stride_d)
+    q = tl.load(Q + offs_ql2[:, None] * stride_l2 + offs_d[None, :] * stride_d)
     dq = tl.zeros([DQ_BLOCK_QL2, HEAD_DIM], dtype=tl.float32)
-    do = tl.load(DO + offs_m[:, None] * stride_l2 + offs_d[None, :] * stride_d)
+    do = tl.load(DO + offs_ql2[:, None] * stride_l2 + offs_d[None, :] * stride_d)
 
-    lse = tl.load(Logsumexp + offs_m)
+    lse = tl.load(Logsumexp + offs_ql2)
     lse = lse[:, None]
 
     dq = _attn_bwd_dq(dq, q, K, V,  #
@@ -501,7 +501,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                       DQ_BLOCK_QL2, DQ_BLOCK_KL2, HEAD_DIM,  #
                       )
     # Write back dQ.
-    dq_ptrs = DQ + offs_m[:, None] * stride_l2 + offs_d[None, :] * stride_d
+    dq_ptrs = DQ + offs_ql2[:, None] * stride_l2 + offs_d[None, :] * stride_d
     dq *= LN2
     tl.store(dq_ptrs, dq)
 
@@ -544,6 +544,72 @@ class _attention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         return o
+
+    @staticmethod
+    def backward(ctx, do):
+        # Retrieve saved tensors from forward pass
+        q, k, v, o, M = ctx.saved_tensors
+        
+        # Verify gradient tensor properties
+        assert do.is_contiguous()
+        assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
+        
+        # Initialize gradient tensors
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        
+        # Get tensor dimensions
+        B, H, L, L, D = q.shape
+        
+        # Define block sizes and parameters
+        PRE_BLOCK = 128
+        NUM_WARPS, NUM_STAGES = 4, 5
+        DKDV_BLOCK_QL2, DKDV_BLOCK_KL2, DQ_BLOCK_QL2, DQ_BLOCK_KL2 = 32, 128, 128, 32
+        BLK_SLICE_FACTOR = 2
+        RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
+        
+        # Scale key tensor for gradient computation
+        # TODO: want to investigate this--source of bugs here
+        arg_k = k * (ctx.sm_scale * RCP_LN2)
+        
+        # Verify context size is compatible with block size
+        assert L % PRE_BLOCK == 0
+
+        # Define preprocessing grid dimensions
+        pre_grid = (L // PRE_BLOCK, B * H)
+        
+        # Initialize delta tensor for gradient computation
+        delta = torch.empty_like(M)
+        
+        # Preprocess gradients
+        _attn_bwd_preprocess[pre_grid](
+            o, do,
+            delta,
+            B, H, L,
+            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM
+        )
+        
+        # Define main backward pass grid dimensions
+        grid = (L // DKDV_BLOCK_KL2, 1, B * H)
+        
+        # Compute gradients
+        _attn_bwd[grid](
+            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
+            M, delta,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            H, L,
+            BLOCK_M1=DKDV_BLOCK_QL2, BLOCK_N1=DKDV_BLOCK_KL2,
+            BLOCK_M2=DQ_BLOCK_QL2, BLOCK_N2=DQ_BLOCK_KL2,
+            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            HEAD_DIM=ctx.HEAD_DIM,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES
+        )
+
+        return dq, dk, dv, None, None
+
+
 
 attention = _attention.apply
 

@@ -323,7 +323,6 @@ def manual_tile_backward(d_out, Q, K, V, B_pw, O, sm_scale, logsumexp_agg, BLOCK
                         # Backward pass of softmax
                         da = p * (dp - OdO_sum[b, h, l1, m:end_m, None])
                         dQ[b, h, l1, m:end_m] += (da @ k) * sm_scale
-                        # TODO: dB computed based on dA, simply sum along l1 dimension
                         dB_pw[b, h, m:end_m, n:end_n] += da
                         dk = da.mT @ q
                         dv_n += dv
