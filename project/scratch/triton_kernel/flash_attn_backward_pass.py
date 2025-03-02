@@ -36,6 +36,8 @@ import torch
 import triton
 import triton.language as tl
 
+INV_LN2: tl.constexpr = 1.4426950408889634  # = 1/ln(2)
+
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 # Helper function to check if we're using HIP (AMD) backend
@@ -240,7 +242,7 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
     acc = tl.zeros([BLOCK_QL2, D], dtype=tl.float32)      # Accumulated attention outputs
 
     pre_bias_qk_scale = sm_scale # 1/sqrt(head_dim)
-    post_bias_qk_scale = 1.44269504 # 1/log(2), to account for log2 in softmax
+    post_bias_qk_scale = INV_LN2 # 1/log(2), to account for log2 in softmax
 
     # Load query block - remains in SRAM throughout computation
     q = tl.load(Q_block_ptr)
@@ -340,7 +342,7 @@ def _attn_bwd_dkdv(dk, dv,  #
         qkT = tl.dot(k, qT)
         qkT_scaled = qkT * sm_scale
         qkT_scaled_bias = qkT_scaled + b_pwT
-        aT = qkT_scaled_bias * 1.44269504 #08889634 # 1/log(2)
+        aT = qkT_scaled_bias * INV_LN2
         # * sm_scale -> * bias -> * 1/log(2), which is what lse has built in.
 
         # Recompute attention probabilities using cached logsumexp values
@@ -372,10 +374,11 @@ def _attn_bwd_dkdv(dk, dv,  #
 # the main inner-loop logic for computing dQ
 # TODO: Probably add the db computation here.
 @triton.jit
-def _attn_bwd_dq(dq, q, K, V,  #
-                 do, lse, D,  #
+def _attn_bwd_dq(dq, q, K, V, B_pw_dq_start, sm_scale, #
+                 do, lse, OdO,  #
                  stride_l2, stride_d,  #
                  H, L,  #
+                 stride_b_pw_l1, stride_b_pw_l2,  #
                  BLOCK_QL2: tl.constexpr,  #
                  BLOCK_KL2: tl.constexpr,  #
                  HEAD_DIM: tl.constexpr,  #
@@ -392,9 +395,10 @@ def _attn_bwd_dq(dq, q, K, V,  #
     # Setup pointers for K and V tensors
     kT_ptrs = K + offs_kl2[None, :] * stride_l2 + offs_d[:, None] * stride_d
     vT_ptrs = V + offs_kl2[None, :] * stride_l2 + offs_d[:, None] * stride_d
+    b_pw_ptrs = B_pw_dq_start + offs_kl2[None, :] * stride_b_pw_l2
 
     # Load precomputed deltas
-    Di = tl.load(D + offs_ql2)
+    Di = tl.load(OdO + offs_ql2)
 
     # Ensure block sizes are compatible
     tl.static_assert(BLOCK_QL2 % BLOCK_KL2 == 0)
@@ -403,18 +407,26 @@ def _attn_bwd_dq(dq, q, K, V,  #
     curr_kl2 = 0
     step_kl2 = BLOCK_KL2
 
+    # Can't combine them in the forward pass because of the bias,
+    # but the bias doesn't imapct the gradient so saves the op.
+    SM_SCALE_INV_LN2 = sm_scale * INV_LN2
+
     # Process blocks to compute gradients
     while curr_kl2 < L:
         # Load K and V values
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
+        b_pw = tl.load(b_pw_ptrs)
 
         # Compute attention scores
         qk = tl.dot(q, kT)
-        # TODO: Need to reapply bias and scaling here.
+        qk_scaled = qk * sm_scale
+        # TODO: Let's not worry about nonzero bias for now.
+        qk_scaled_bias = qk_scaled + b_pw
+        a = qk_scaled_bias * INV_LN2
         # * sm_scale -> * bias -> * 1/log(2), which is what lse has built in.
 
-        p = tl.math.exp2(qk - lse)
+        p = tl.math.exp2(a - lse)
 
         # Compute gradients
         dp = tl.dot(do, vT).to(tl.float32)  # Gradient wrt attention probabilities
@@ -423,12 +435,14 @@ def _attn_bwd_dq(dq, q, K, V,  #
         # TODO: add ds dimension to db_pw
 
         # Update query gradients
-        dq += tl.dot(ds, tl.trans(kT))
+        # SM scale, and LN2
+        dq += tl.dot(ds, tl.trans(kT)) * SM_SCALE_INV_LN2
 
         # Update pointers for next iteration
         curr_kl2 += step_kl2
         kT_ptrs += step_kl2 * stride_l2
         vT_ptrs += step_kl2 * stride_l2
+        b_pw_ptrs += step_kl2 * stride_b_pw_l2
 
     return dq
 
@@ -475,6 +489,7 @@ def _attn_bwd(Q, K, V, B_pw, sm_scale,  #
     DK += adj
     DV += adj
     DB_pw += offs_b_pw
+    B_pw += offs_b_pw
     Logsumexp += off_bh_1d
     OdO += off_bh_1d
 
@@ -525,10 +540,13 @@ def _attn_bwd(Q, K, V, B_pw, sm_scale,  #
     lse = tl.load(Logsumexp + offs_ql2)
     lse = lse[:, None]
 
-    dq = _attn_bwd_dq(dq, q, K, V,  #
+    B_pw_dq_start = B_pw + offs_ql2[:, None] * stride_b_pw_l1
+
+    dq = _attn_bwd_dq(dq, q, K, V, B_pw_dq_start, sm_scale,  #
                       do, lse, OdO,  #
                       stride_l2, stride_d,  #
                       H, L,  #
+                      stride_b_pw_l1, stride_b_pw_l2,  #
                       DQ_BLOCK_QL2, DQ_BLOCK_KL2, HEAD_DIM,  #
                       )
     # Write back dQ.
@@ -691,7 +709,7 @@ def test_op(Z, H, L, HEAD_DIM, dtype=torch.float16):
     k = (torch.empty((Z, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     v = (torch.empty((Z, H, L, L, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     b = (torch.empty((Z, H, L, L), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    b = torch.zeros_like(b, requires_grad=True) # Turn off bias for now
+    # b = torch.zeros_like(b, requires_grad=True) # Turn off bias for now
     sm_scale = 0.5
     dout = torch.randn_like(q)
 
