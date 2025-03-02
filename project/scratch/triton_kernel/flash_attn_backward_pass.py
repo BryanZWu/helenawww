@@ -292,7 +292,7 @@ def _attn_bwd_dkdv(dk, dv,  #
                    DO,  #
                    M, D,  #
                    stride_tok, stride_d,  #
-                   H, N_CTX, BLOCK_M1: tl.constexpr,  #
+                   H, L, BLOCK_M1: tl.constexpr,  #
                    BLOCK_N1: tl.constexpr,  #
                    HEAD_DIM: tl.constexpr,  #
                 ):
@@ -358,24 +358,23 @@ def _attn_bwd_dkdv(dk, dv,  #
 def _attn_bwd_dq(dq, q, K, V,  #
                  do, m, D,  #
                  stride_tok, stride_d,  #
-                 H, N_CTX,  #
+                 H, L,  #
                  BLOCK_M2: tl.constexpr,  #
                  BLOCK_N2: tl.constexpr,  #
                  HEAD_DIM: tl.constexpr,  #
-                 start_m, start_n, num_steps,  #
-                 MASK: tl.constexpr):
+        ):
     """
     Computes gradients with respect to queries (dq)--each warp/program
     loops over the KV sequence dimension, and accumulates dq in sram.
     """
     # Initialize offsets for the current block
-    offs_m = start_m + tl.arange(0, BLOCK_M2)
-    offs_n = start_n + tl.arange(0, BLOCK_N2)
-    offs_k = tl.arange(0, HEAD_DIM)
+    offs_m = tl.arange(0, BLOCK_M2)
+    offs_n = tl.arange(0, BLOCK_N2)
+    offs_d = tl.arange(0, HEAD_DIM)
     
     # Setup pointers for K and V tensors
-    kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
-    vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
+    kT_ptrs = K + offs_n[None, :] * stride_tok + offs_d[:, None] * stride_d
+    vT_ptrs = V + offs_n[None, :] * stride_tok + offs_d[:, None] * stride_d
     
     # Load precomputed deltas
     Di = tl.load(D + offs_m)
@@ -384,11 +383,11 @@ def _attn_bwd_dq(dq, q, K, V,  #
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
     
     # Initialize tracking variables
-    curr_n = start_n
+    curr_n = 0
     step_n = BLOCK_N2
     
     # Process blocks to compute gradients
-    for blk_idx in range(num_steps):
+    while curr_n < L:
         # Load K and V values
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
@@ -492,46 +491,24 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     tl.store(dk_ptrs, dk)
 
     # THIS BLOCK DOES DQ:
-    start_ql2 = pid * DQ_BLOCK_QL2
-    end_n = start_ql2 + DQ_BLOCK_QL2
-
-    MASK_BLOCK_N2: tl.constexpr = DQ_BLOCK_KL2 // BLK_SLICE_FACTOR
     offs_m = start_ql2 + tl.arange(0, DQ_BLOCK_QL2)
 
-    q = tl.load(Q + offs_m[:, None] * stride_tok + offs_d[None, :] * stride_d)
+    q = tl.load(Q + offs_m[:, None] * stride_l2 + offs_d[None, :] * stride_d)
     dq = tl.zeros([DQ_BLOCK_QL2, HEAD_DIM], dtype=tl.float32)
-    do = tl.load(DO + offs_m[:, None] * stride_tok + offs_d[None, :] * stride_d)
+    do = tl.load(DO + offs_m[:, None] * stride_l2 + offs_d[None, :] * stride_d)
 
     m = tl.load(Logsumexp + offs_m)
     m = m[:, None]
 
-    # Compute dQ for masked (diagonal) blocks.
-    # NOTE: This code scans each row of QK^T backward (from right to left,
-    # but inside each call to _attn_bwd_dq, from left to right), but that's
-    # not due to anything important.  I just wanted to reuse the loop
-    # structure for dK & dV above as much as possible.
-    num_steps = DQ_BLOCK_QL2 // MASK_BLOCK_N2
     dq = _attn_bwd_dq(dq, q, K, V,  #
                       do, m, OdO,  #
-                      stride_tok, stride_d,  #
-                      H, L,  #
-                      DQ_BLOCK_QL2, MASK_BLOCK_N2, HEAD_DIM,  #
-                      start_ql2, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
-                      MASK=True  #
-                      )
-    end_n -= num_steps * MASK_BLOCK_N2
-    # stage 2
-    num_steps = end_n // DQ_BLOCK_KL2
-    dq = _attn_bwd_dq(dq, q, K, V,  #
-                      do, m, OdO,  #
-                      stride_tok, stride_d,  #
+                      stride_l2, stride_d,  #
                       H, L,  #
                       DQ_BLOCK_QL2, DQ_BLOCK_KL2, HEAD_DIM,  #
                       start_ql2, end_n - num_steps * DQ_BLOCK_KL2, num_steps,  #
-                      MASK=False  #
                       )
     # Write back dQ.
-    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_d[None, :] * stride_d
+    dq_ptrs = DQ + offs_m[:, None] * stride_l2 + offs_d[None, :] * stride_d
     dq *= LN2
     tl.store(dq_ptrs, dq)
 
