@@ -26,6 +26,9 @@ Tensors:
     - O: (B, H, QL1, QL2, D) Output
 '''
 
+import sys
+sys.path.append('..')
+from brainstorm import reference_tt_tiled
 import pytest
 import torch
 # import triton.tools.experimental_descriptor
@@ -264,7 +267,7 @@ def _attn_fwd(Q, K, V, B_pw, sm_scale, M, Out,  # sm_scale: scaling factor for s
 # Preprocess can more or less stay the same
 @triton.jit
 def _attn_bwd_preprocess(O, DO,  #
-                         Delta,  #
+                         O_DO,  #
                          B, H, L,  #
                          BLOCK_QL2: tl.constexpr, D: tl.constexpr,  #
                          ):
@@ -281,10 +284,10 @@ def _attn_bwd_preprocess(O, DO,  #
     do = tl.load(DO + off_bhql1 * L * D + off_ql2[:, None] * D + off_d[None, :]).to(tl.float32)
 
     # Compute delta values (dot product of output and gradient)
-    delta = tl.sum(o * do, axis=1)
+    o_do = tl.sum(o * do, axis=1)
 
     # Store computed deltas
-    tl.store(Delta + off_bhql1 * L + off_ql2, delta)
+    tl.store(O_DO + off_bhql1 * L + off_ql2, o_do)
 
 @triton.jit
 def _attn_bwd_dkdv(dk, dv,  #
@@ -318,6 +321,7 @@ def _attn_bwd_dkdv(dk, dv,  #
 
     # Process blocks to compute gradients
     while curr_ql2 < L:
+        breakpoint()
         # Load Q values and compute Q*K^T
         qT = tl.load(qT_ptrs)
         # For the 1d tensors the stride is just 1
@@ -527,9 +531,14 @@ class _attention(torch.autograd.Function):
 
         ctx.grid = grid
 
-        # Launch regular kernel
-        _attn_fwd[grid](
-            q, k, v, b_pw, sm_scale, M, o,
+        debugging_backward_pass = False
+        if debugging_backward_pass:
+            o, logsumexp = reference_tt_tiled(q, k, v, b_pw, sm_scale)
+            M = logsumexp
+        else:
+            # Launch regular kernel
+            _attn_fwd[grid](
+                q, k, v, b_pw, sm_scale, M, o,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3), k.stride(4),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3), v.stride(4),
@@ -547,6 +556,7 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
+        dtype = do.dtype
         # Retrieve saved tensors from forward pass
         q, k, v, o, logsumexp = ctx.saved_tensors
 
@@ -576,7 +586,7 @@ class _attention(torch.autograd.Function):
         assert L % PRE_BLOCK == 0
 
         # Define preprocessing grid dimensions
-        pre_grid = (L // PRE_BLOCK, B * H)
+        pre_grid = (L // PRE_BLOCK, B * H * L)
 
         # Initialize delta tensor for gradient computation
         o_do = torch.empty_like(logsumexp)
@@ -589,8 +599,13 @@ class _attention(torch.autograd.Function):
             BLOCK_QL2=PRE_BLOCK, D=ctx.HEAD_DIM
         )
 
+        # quick assert on odo
+        # TODO: clean up the dtype handling overall.
+        breakpoint()
+        assert torch.allclose(o_do.to(dtype), (o * do).sum(dim=-1), atol=1e-3)
+
         # Define main backward pass grid dimensions
-        grid = (L // DKDV_BLOCK_KL2, 1, B * H)
+        grid = (L // DKDV_BLOCK_KL2, 1, B * H * L)
 
         # Compute gradients
         _attn_bwd[grid](
@@ -640,6 +655,7 @@ def test_op(Z, H, L, HEAD_DIM, dtype=torch.float16):
     ref_db, b.grad = b.grad.clone(), None
 
     # Triton implementation
+    # tri_out = attention(q, k, v, b, sm_scale).to(dtype)
     tri_out = attention(q, k, v, b, sm_scale).half()
 
     # Compare results--forward pass
@@ -815,6 +831,7 @@ def reference_tt_attn(q, k, v, b, sm_scale):
 if __name__ == "__main__":
     # Run basic correctness test
     test_op(Z=1, H=1, L=256, HEAD_DIM=32, dtype=torch.float16)
+    # test_op(Z=1, H=1, L=256, HEAD_DIM=32, dtype=torch.float32)
     # test_op(Z=2, H=4, L=256, HEAD_DIM=8, dtype=torch.float16)
 
     # Run benchmarks
