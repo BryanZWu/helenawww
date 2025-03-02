@@ -275,14 +275,14 @@ def _attn_bwd_preprocess(O, DO,  #
     off_ql2 = tl.program_id(0) * BLOCK_QL2 + tl.arange(0, BLOCK_QL2)
     off_bhql1 = tl.program_id(1)
     off_d = tl.arange(0, D)
-    
+
     # Load output and gradient tensors
     o = tl.load(O + off_bhql1 * L * D + off_ql2[:, None] * D + off_d[None, :])
     do = tl.load(DO + off_bhql1 * L * D + off_ql2[:, None] * D + off_d[None, :]).to(tl.float32)
-    
+
     # Compute delta values (dot product of output and gradient)
     delta = tl.sum(o * do, axis=1)
-    
+
     # Store computed deltas
     tl.store(Delta + off_bhql1 * L + off_ql2, delta)
 
@@ -304,18 +304,18 @@ def _attn_bwd_dkdv(dk, dv,  #
     offs_m = tl.arange(0, BLOCK_M1)
     offs_n = tl.arange(0, BLOCK_N1)
     offs_d = tl.arange(0, HEAD_DIM)
-    
+
     # Setup pointers for Q and DO tensors
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_d[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_d[None, :] * stride_d
-    
+
     # Ensure block sizes are compatible
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
-    
+
     # Initialize tracking variables
     curr_m = 0
     step_m = BLOCK_M1
-    
+
     # Process blocks to compute gradients
     while curr_m < L:
         # Load Q values and compute Q*K^T
@@ -323,33 +323,33 @@ def _attn_bwd_dkdv(dk, dv,  #
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m)
         qkT = tl.dot(k, qT)
-        
+
         # Compute attention probabilities
         pT = tl.math.exp2(qkT - m[None, :])
-        
+
         # Load gradients
         do = tl.load(do_ptrs)
-        
+
         # Compute dV gradients
         ppT = pT.to(tl.float16)
         dv += tl.dot(ppT, do)
-        
+
         # Load precomputed deltas
         Di = tl.load(D + offs_m)
-        
+
         # Compute dP (gradient of probabilities) and dS (gradient of scores)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(tl.float16)
-        
+
         # Compute dK gradients
         dk += tl.dot(dsT, tl.trans(qT))
-        
+
         # Update pointers for next iteration
         curr_m += step_m
         qT_ptrs += step_m * stride_tok
         do_ptrs += step_m * stride_tok
-        
+
     return dk, dv
 
 
@@ -371,50 +371,50 @@ def _attn_bwd_dq(dq, q, K, V,  #
     offs_m = tl.arange(0, BLOCK_M2)
     offs_n = tl.arange(0, BLOCK_N2)
     offs_d = tl.arange(0, HEAD_DIM)
-    
+
     # Setup pointers for K and V tensors
     kT_ptrs = K + offs_n[None, :] * stride_tok + offs_d[:, None] * stride_d
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_d[:, None] * stride_d
-    
+
     # Load precomputed deltas
     Di = tl.load(D + offs_m)
-    
+
     # Ensure block sizes are compatible
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
-    
+
     # Initialize tracking variables
     curr_n = 0
     step_n = BLOCK_N2
-    
+
     # Process blocks to compute gradients
     while curr_n < L:
         # Load K and V values
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
-        
+
         # Compute attention scores
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
-        
+
         # Apply causal masking if needed
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_N2)
             mask = (offs_m[:, None] >= offs_n[None, :])
             p = tl.where(mask, p, 0.0)
-            
+
         # Compute gradients
         dp = tl.dot(do, vT).to(tl.float32)  # Gradient wrt attention probabilities
         ds = p * (dp - Di[:, None])  # Gradient wrt attention scores
         ds = ds.to(tl.float16)
-        
+
         # Update query gradients
         dq += tl.dot(ds, tl.trans(kT))
-        
+
         # Update pointers for next iteration
         curr_n += step_n
         kT_ptrs += step_n * stride_tok
         vT_ptrs += step_n * stride_tok
-        
+
     return dq
 
 
@@ -572,7 +572,7 @@ def test_op(Z, H, L, HEAD_DIM, dtype=torch.float16):
     sm_scale = 0.5
     dout = torch.randn_like(q)
 
-    
+
     ref_out = reference_tt_attn(q, k, v, b, sm_scale)
 
     # Compute reference gradients
@@ -608,7 +608,7 @@ configs = []
 for mode in ["fwd", "bwd"]:
     if mode == "bwd":
         continue
-    
+
     # Peak memory usage benchmark
     configs.append(
         triton.testing.Benchmark(
