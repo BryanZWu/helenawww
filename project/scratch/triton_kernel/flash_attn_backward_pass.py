@@ -301,31 +301,31 @@ def _attn_bwd_dkdv(dk, dv,  #
     loops over the Q dimension, and accumulates dkdv in sram.
     """
     # Initialize offsets for the current block
-    offs_m = tl.arange(0, BLOCK_QL2)
-    offs_n = tl.arange(0, BLOCK_KL2)
+    offs_ql2 = tl.arange(0, BLOCK_QL2)
+    offs_kl2 = tl.arange(0, BLOCK_KL2)
     offs_d = tl.arange(0, HEAD_DIM)
 
     # Setup pointers for Q and DO tensors
-    qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_d[:, None] * stride_d
-    do_ptrs = DO + offs_m[:, None] * stride_tok + offs_d[None, :] * stride_d
+    qT_ptrs = Q + offs_ql2[None, :] * stride_tok + offs_d[:, None] * stride_d
+    do_ptrs = DO + offs_ql2[:, None] * stride_tok + offs_d[None, :] * stride_d
 
     # Ensure block sizes are compatible
     tl.static_assert(BLOCK_KL2 % BLOCK_QL2 == 0)
 
     # Initialize tracking variables
     curr_ql2 = 0
-    step_m = BLOCK_QL2
+    step_ql2 = BLOCK_QL2
 
     # Process blocks to compute gradients
     while curr_ql2 < L:
         # Load Q values and compute Q*K^T
         qT = tl.load(qT_ptrs)
-        offs_m = curr_ql2 + tl.arange(0, BLOCK_QL2)
-        m = tl.load(Logsumexp + offs_m)
+        offs_ql2 = curr_ql2 + tl.arange(0, BLOCK_QL2)
+        lse = tl.load(Logsumexp + offs_ql2)
         qkT = tl.dot(k, qT)
 
         # Compute attention probabilities
-        pT = tl.math.exp2(qkT - m[None, :])
+        pT = tl.math.exp2(qkT - lse[None, :])
 
         # Load gradients
         do = tl.load(do_ptrs)
@@ -335,7 +335,7 @@ def _attn_bwd_dkdv(dk, dv,  #
         dv += tl.dot(ppT, do)
 
         # Load precomputed deltas
-        Di = tl.load(D + offs_m)
+        Di = tl.load(D + offs_ql2)
 
         # Compute dP (gradient of probabilities) and dS (gradient of scores)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
@@ -346,9 +346,9 @@ def _attn_bwd_dkdv(dk, dv,  #
         dk += tl.dot(dsT, tl.trans(qT))
 
         # Update pointers for next iteration
-        curr_ql2 += step_m
-        qT_ptrs += step_m * stride_tok
-        do_ptrs += step_m * stride_tok
+        curr_ql2 += step_ql2
+        qT_ptrs += step_ql2 * stride_tok
+        do_ptrs += step_ql2 * stride_tok
 
     return dk, dv
 
